@@ -1,8 +1,8 @@
-import { Prisma, UserRole } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 import bcrypt from "bcryptjs";
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
-import { requireAuth, requireRole } from "../middleware/auth";
+import { requireAuth } from "../middleware/auth";
 import { normalizeBrazilPhone } from "../lib/phone";
 import { prisma } from "../lib/prisma";
 import {
@@ -246,12 +246,3 @@ authRouter.get("/me", requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-/** Exemplo de rota só para ADMIN — use o mesmo padrão em rotas futuras do painel. */
-authRouter.get(
-  "/admin/ping",
-  requireAuth,
-  requireRole(UserRole.ADMIN),
-  (_req: Request, res: Response) => {
-    res.json({ ok: true, scope: "admin" });
-  },
-);

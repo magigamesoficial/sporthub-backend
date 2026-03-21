@@ -3,7 +3,9 @@ import cors from "cors";
 import express, { type Request, type Response } from "express";
 import { prisma } from "./lib/prisma";
 import { getJwtSecret } from "./lib/jwt";
+import { adminRouter } from "./routes/admin";
 import { authRouter } from "./routes/auth";
+import { groupsRouter } from "./routes/groups";
 import { legalRouter } from "./routes/legal";
 
 if (process.env.NODE_ENV === "production") {
@@ -41,8 +43,8 @@ app.use(
 app.get("/", (_req: Request, res: Response) => {
   res.json({
     name: "SportHub API",
-    version: "0.3.0",
-    docs: "Público: /health, /health/db, /legal/active, /auth/captcha, POST /auth/register, POST /auth/login. Protegido (Bearer): GET /auth/me, GET /auth/admin/ping (só ADMIN).",
+    version: "0.4.0",
+    docs: "Público: /health, /health/db, /legal/active, /auth/captcha, POST /auth/register, POST /auth/login. Bearer: GET /auth/me, POST /groups, GET /groups/mine. Admin: GET/POST /admin/legal-documents, GET /admin/ping.",
   });
 });
 
@@ -67,6 +69,8 @@ app.get("/health/db", async (_req: Request, res: Response) => {
 
 app.use("/legal", legalRouter);
 app.use("/auth", authRouter);
+app.use("/groups", groupsRouter);
+app.use("/admin", adminRouter);
 
 const port = Number(process.env.PORT) || 4000;
 

@@ -12,14 +12,36 @@ enum UserRole {
   ADMIN
 }
 
+enum Sport {
+  FOOTBALL
+  VOLLEYBALL
+  BEACH_TENNIS
+  PADEL
+  FUTVOLEI
+  BASKETBALL
+}
+
+enum GroupVisibility {
+  PUBLIC
+  PRIVATE
+}
+
+enum GroupMemberRole {
+  PRESIDENT
+  VICE_PRESIDENT
+  TREASURER
+  MODERATOR
+  MEMBER
+}
+
 model User {
-  id        String   @id @default(cuid())
-  email     String   @unique
-  phone     String   @unique
+  id           String   @id @default(cuid())
+  email        String   @unique
+  phone        String   @unique
   passwordHash String
-  fullName  String
-  birthDate DateTime @db.Date
-  role      UserRole @default(ATHLETE)
+  fullName     String
+  birthDate    DateTime @db.Date
+  role         UserRole @default(ATHLETE)
 
   termsVersion      Int
   privacyVersion    Int
@@ -28,6 +50,9 @@ model User {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  presidentOf      Group[]         @relation("PresidentGroups")
+  groupMemberships GroupMember[]
 
   @@map("users")
 }
@@ -45,4 +70,33 @@ model LegalDocument {
   @@unique([slug, version])
   @@index([slug, isActive])
   @@map("legal_documents")
+}
+
+model Group {
+  id          String          @id @default(cuid())
+  publicCode  String          @unique @db.VarChar(6)
+  name        String
+  visibility  GroupVisibility
+  sport       Sport
+  presidentId String
+  president   User            @relation("PresidentGroups", fields: [presidentId], references: [id])
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  members GroupMember[]
+
+  @@map("groups")
+}
+
+model GroupMember {
+  id      String          @id @default(cuid())
+  groupId String
+  group   Group           @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  userId  String
+  user    User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role    GroupMemberRole
+  joinedAt DateTime       @default(now())
+
+  @@unique([groupId, userId])
+  @@map("group_members")
 }

@@ -34,6 +34,18 @@ async function main() {
       },
     });
   }
+
+  const promoteEmail = process.env.SEED_ADMIN_EMAIL?.trim().toLowerCase();
+  if (promoteEmail) {
+    const r = await prisma.user.updateMany({
+      where: { email: promoteEmail },
+      data: { role: "ADMIN" },
+    });
+    if (r.count > 0) {
+      // eslint-disable-next-line no-console
+      console.log(`Seed: usuário ${promoteEmail} promovido a ADMIN.`);
+    }
+  }
 }
 
 main()

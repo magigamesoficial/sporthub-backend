@@ -12,11 +12,11 @@
     "lint": "eslint src --ext .ts",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
-    "db:seed": "tsx prisma/seed.ts",
+    "db:seed": "npx --yes tsx prisma/seed.ts",
     "postinstall": "prisma generate"
   },
   "prisma": {
-    "seed": "tsx prisma/seed.ts"
+    "seed": "npx --yes tsx prisma/seed.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.19.0",
@@ -25,6 +25,7 @@
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "jsonwebtoken": "^9.0.2",
+    "tsx": "^4.19.3",
     "zod": "^3.24.2"
   },
   "devDependencies": {
@@ -37,7 +38,6 @@
     "@typescript-eslint/parser": "^8.26.1",
     "eslint": "^8.57.1",
     "prisma": "^6.19.0",
-    "tsx": "^4.19.3",
     "typescript": "^5.8.2"
   }
 }
