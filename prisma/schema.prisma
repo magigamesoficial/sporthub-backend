@@ -1,0 +1,48 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ATHLETE
+  ADMIN
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  phone     String   @unique
+  passwordHash String
+  fullName  String
+  birthDate DateTime @db.Date
+  role      UserRole @default(ATHLETE)
+
+  termsVersion      Int
+  privacyVersion    Int
+  termsAcceptedAt   DateTime
+  privacyAcceptedAt DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("users")
+}
+
+model LegalDocument {
+  id       String @id @default(cuid())
+  slug     String
+  version  Int
+  title    String
+  content  String @db.Text
+  isActive Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@unique([slug, version])
+  @@index([slug, isActive])
+  @@map("legal_documents")
+}

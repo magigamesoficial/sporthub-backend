@@ -1,7 +1,21 @@
 import "dotenv/config";
 import cors from "cors";
 import express, { type Request, type Response } from "express";
-import { closePool, getPool } from "./db";
+import { prisma } from "./lib/prisma";
+import { getJwtSecret } from "./lib/jwt";
+import { authRouter } from "./routes/auth";
+import { legalRouter } from "./routes/legal";
+
+if (process.env.NODE_ENV === "production") {
+  try {
+    getJwtSecret();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // eslint-disable-next-line no-console
+    console.error(msg);
+    process.exit(1);
+  }
+}
 
 const app = express();
 app.disable("x-powered-by");
@@ -27,8 +41,8 @@ app.use(
 app.get("/", (_req: Request, res: Response) => {
   res.json({
     name: "SportHub API",
-    version: "0.1.0",
-    docs: "Use /health e /health/db para verificar o serviço e o banco.",
+    version: "0.3.0",
+    docs: "Público: /health, /health/db, /legal/active, /auth/captcha, POST /auth/register, POST /auth/login. Protegido (Bearer): GET /auth/me, GET /auth/admin/ping (só ADMIN).",
   });
 });
 
@@ -43,13 +57,16 @@ app.get("/health/db", async (_req: Request, res: Response) => {
   }
 
   try {
-    const r = await getPool().query("SELECT 1 AS ok");
-    res.json({ ok: true, db: true, result: r.rows[0] });
+    await prisma.$queryRaw`SELECT 1 AS ok`;
+    res.json({ ok: true, db: true });
   } catch (err) {
     const message = err instanceof Error ? err.message : "erro desconhecido";
     res.status(503).json({ ok: false, db: false, reason: message });
   }
 });
+
+app.use("/legal", legalRouter);
+app.use("/auth", authRouter);
 
 const port = Number(process.env.PORT) || 4000;
 
@@ -62,7 +79,7 @@ function shutdown(signal: string) {
   // eslint-disable-next-line no-console
   console.log(`${signal} recebido, encerrando…`);
   server.close(() => {
-    void closePool().finally(() => process.exit(0));
+    void prisma.$disconnect().finally(() => process.exit(0));
   });
 }
 
