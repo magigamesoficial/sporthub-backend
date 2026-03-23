@@ -13,12 +13,14 @@ import { normalizeBrazilPhone } from "../lib/phone";
 import { prisma } from "../lib/prisma";
 import { requireAuth } from "../middleware/auth";
 import { groupFeesRouter } from "./groupFees";
+import { groupGamesRouter } from "./groupGames";
 
 export const groupsRouter = Router();
 
 groupsRouter.use(requireAuth);
 
 groupsRouter.use("/:groupId/fees", groupFeesRouter);
+groupsRouter.use("/:groupId/games", groupGamesRouter);
 
 const createGroupSchema = z.object({
   name: z.string().trim().min(2, "Nome do grupo muito curto"),

@@ -40,6 +40,12 @@ enum JoinRequestStatus {
   REJECTED
 }
 
+enum AttendanceStatus {
+  GOING
+  NOT_GOING
+  MAYBE
+}
+
 model User {
   id           String   @id @default(cuid())
   email        String   @unique
@@ -62,6 +68,8 @@ model User {
   groupJoinRequests   GroupJoinRequest[]
   monthlyFeesAsMember MemberMonthlyFee[]   @relation("MonthlyFeeMember")
   monthlyFeesRecorded MemberMonthlyFee[]   @relation("FeeRecorder")
+  gamesCreated        GroupGame[]          @relation("GamesCreated")
+  gameAttendances     GameAttendance[]
 
   @@map("users")
 }
@@ -95,6 +103,7 @@ model Group {
   members           GroupMember[]
   joinRequests      GroupJoinRequest[]
   memberMonthlyFees MemberMonthlyFee[]
+  games             GroupGame[]
 
   @@map("groups")
 }
@@ -141,4 +150,34 @@ model MemberMonthlyFee {
   @@unique([groupId, userId, periodMonth])
   @@index([groupId, periodMonth])
   @@map("member_monthly_fees")
+}
+
+model GroupGame {
+  id              String   @id @default(cuid())
+  groupId         String
+  group           Group    @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  title           String   @default("Jogo")
+  location        String?
+  startsAt        DateTime
+  createdByUserId String?
+  createdBy       User?    @relation("GamesCreated", fields: [createdByUserId], references: [id], onDelete: SetNull)
+  createdAt       DateTime @default(now())
+
+  attendances GameAttendance[]
+
+  @@index([groupId, startsAt])
+  @@map("group_games")
+}
+
+model GameAttendance {
+  id        String           @id @default(cuid())
+  gameId    String
+  game      GroupGame        @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status    AttendanceStatus
+  updatedAt DateTime         @updatedAt
+
+  @@unique([gameId, userId])
+  @@map("game_attendances")
 }

@@ -41,11 +41,15 @@ app.use(
   }),
 );
 
+const PUBLIC_API_BASE =
+  process.env.PUBLIC_API_BASE_URL ?? "https://sporthub-backend.onrender.com";
+
 app.get("/", (_req: Request, res: Response) => {
   res.json({
     name: "SportHub API",
     version: "0.6.0",
-    docs: "Mensalidades: GET/POST /groups/:groupId/fees/:YYYY-MM e .../mark-paid|mark-unpaid. Grupos públicos: preview-code, join-by-code, join-requests. Ver /groups/*, /auth/*, /admin/*.",
+    publicBaseUrl: PUBLIC_API_BASE,
+    docs: "Jogos: /groups/:groupId/games (CRUD + POST .../:gameId/attendance). Mensalidades: /groups/:groupId/fees/:YYYY-MM. Grupos públicos: preview-code, join-by-code. Ver /groups/*, /auth/*, /admin/*.",
   });
 });
 

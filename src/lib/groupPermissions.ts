@@ -33,3 +33,8 @@ export const MONTHLY_FEE_MANAGER_ROLES: GroupMemberRole[] = [
 export function canManageMonthlyFees(role: GroupMemberRole): boolean {
   return MONTHLY_FEE_MANAGER_ROLES.includes(role);
 }
+
+/** Excluir jogos agendados (líderes). Criar jogo: qualquer membro. */
+export function canManageGroupGames(role: GroupMemberRole): boolean {
+  return JOIN_APPROVER_ROLES.includes(role);
+}
