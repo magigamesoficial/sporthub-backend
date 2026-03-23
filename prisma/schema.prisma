@@ -34,6 +34,12 @@ enum GroupMemberRole {
   MEMBER
 }
 
+enum JoinRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
 model User {
   id           String   @id @default(cuid())
   email        String   @unique
@@ -51,8 +57,9 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  presidentOf      Group[]         @relation("PresidentGroups")
+  presidentOf        Group[]              @relation("PresidentGroups")
   groupMemberships GroupMember[]
+  groupJoinRequests GroupJoinRequest[]
 
   @@map("users")
 }
@@ -83,9 +90,24 @@ model Group {
   createdAt   DateTime        @default(now())
   updatedAt   DateTime        @updatedAt
 
-  members GroupMember[]
+  members      GroupMember[]
+  joinRequests GroupJoinRequest[]
 
   @@map("groups")
+}
+
+model GroupJoinRequest {
+  id          String            @id @default(cuid())
+  groupId     String
+  group       Group             @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status      JoinRequestStatus @default(PENDING)
+  createdAt   DateTime          @default(now())
+  respondedAt DateTime?
+
+  @@index([groupId, status])
+  @@map("group_join_requests")
 }
 
 model GroupMember {

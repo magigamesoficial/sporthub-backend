@@ -10,6 +10,11 @@ import {
   signCaptchaToken,
   verifyCaptchaToken,
 } from "../lib/jwt";
+import {
+  authCaptchaLimiter,
+  authLoginLimiter,
+  authRegisterLimiter,
+} from "../middleware/rateLimit";
 
 export const authRouter = Router();
 
@@ -17,7 +22,7 @@ function randomInt(min: number, max: number): number {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-authRouter.get("/captcha", (_req: Request, res: Response) => {
+authRouter.get("/captcha", authCaptchaLimiter, (_req: Request, res: Response) => {
   try {
     const n1 = randomInt(1, 20);
     const n2 = randomInt(1, 20);
@@ -50,7 +55,7 @@ const registerSchema = z.object({
     .refine((v) => v === true, { message: "Aceite a política de privacidade" }),
 });
 
-authRouter.post("/register", async (req: Request, res: Response) => {
+authRouter.post("/register", authRegisterLimiter, async (req: Request, res: Response) => {
   const parsed = registerSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: "Dados inválidos", details: parsed.error.flatten() });
@@ -164,7 +169,7 @@ const loginSchema = z.object({
   password: z.string().min(1, "Senha obrigatória"),
 });
 
-authRouter.post("/login", async (req: Request, res: Response) => {
+authRouter.post("/login", authLoginLimiter, async (req: Request, res: Response) => {
   const parsed = loginSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: "Dados inválidos", details: parsed.error.flatten() });
@@ -186,13 +191,20 @@ authRouter.post("/login", async (req: Request, res: Response) => {
     });
 
     if (!user) {
-      res.status(401).json({ error: "Telefone ou senha incorretos" });
+      res.status(401).json({
+        error:
+          "Não encontramos uma conta com este celular. Confira o número com DDD ou crie uma conta.",
+        code: "USER_NOT_FOUND",
+      });
       return;
     }
 
     const ok = await bcrypt.compare(parsed.data.password, user.passwordHash);
     if (!ok) {
-      res.status(401).json({ error: "Telefone ou senha incorretos" });
+      res.status(401).json({
+        error: "Senha incorreta. Tente novamente.",
+        code: "INVALID_PASSWORD",
+      });
       return;
     }
 

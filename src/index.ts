@@ -21,6 +21,7 @@ if (process.env.NODE_ENV === "production") {
 
 const app = express();
 app.disable("x-powered-by");
+app.set("trust proxy", 1);
 app.use(express.json({ limit: "1mb" }));
 
 const corsOrigins = (process.env.CORS_ORIGIN ?? "")
@@ -43,8 +44,8 @@ app.use(
 app.get("/", (_req: Request, res: Response) => {
   res.json({
     name: "SportHub API",
-    version: "0.4.0",
-    docs: "Público: /health, /health/db, /legal/active, /auth/captcha, POST /auth/register, POST /auth/login. Bearer: GET /auth/me, POST /groups, GET /groups/mine. Admin: GET/POST /admin/legal-documents, GET /admin/ping.",
+    version: "0.6.0",
+    docs: "Grupos públicos: GET /groups/preview-code/:code, POST /groups/join-by-code, POST /groups/:id/join-requests; aprovação: GET/POST .../join-requests/:rid/approve|reject. Ver /groups/*, /auth/*, /admin/*.",
   });
 });
 
