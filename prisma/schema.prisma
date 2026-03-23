@@ -57,9 +57,11 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  presidentOf        Group[]              @relation("PresidentGroups")
-  groupMemberships GroupMember[]
-  groupJoinRequests GroupJoinRequest[]
+  presidentOf         Group[]              @relation("PresidentGroups")
+  groupMemberships    GroupMember[]
+  groupJoinRequests   GroupJoinRequest[]
+  monthlyFeesAsMember MemberMonthlyFee[]   @relation("MonthlyFeeMember")
+  monthlyFeesRecorded MemberMonthlyFee[]   @relation("FeeRecorder")
 
   @@map("users")
 }
@@ -90,8 +92,9 @@ model Group {
   createdAt   DateTime        @default(now())
   updatedAt   DateTime        @updatedAt
 
-  members      GroupMember[]
-  joinRequests GroupJoinRequest[]
+  members           GroupMember[]
+  joinRequests      GroupJoinRequest[]
+  memberMonthlyFees MemberMonthlyFee[]
 
   @@map("groups")
 }
@@ -121,4 +124,21 @@ model GroupMember {
 
   @@unique([groupId, userId])
   @@map("group_members")
+}
+
+/** Registro de mensalidade paga no mês (YYYY-MM). Ausência de registro = em aberto. */
+model MemberMonthlyFee {
+  id               String   @id @default(cuid())
+  groupId          String
+  group            Group    @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  userId           String
+  user             User     @relation("MonthlyFeeMember", fields: [userId], references: [id], onDelete: Cascade)
+  periodMonth      String   @db.VarChar(7)
+  paidAt           DateTime @default(now())
+  recordedByUserId String?
+  recordedBy       User?    @relation("FeeRecorder", fields: [recordedByUserId], references: [id], onDelete: SetNull)
+
+  @@unique([groupId, userId, periodMonth])
+  @@index([groupId, periodMonth])
+  @@map("member_monthly_fees")
 }

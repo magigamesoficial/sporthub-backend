@@ -22,3 +22,14 @@ export const JOIN_APPROVER_ROLES: GroupMemberRole[] = [
 export function canApproveJoinRequests(role: GroupMemberRole): boolean {
   return JOIN_APPROVER_ROLES.includes(role);
 }
+
+/** Quem pode marcar mensalidade como paga ou em aberto (tesouraria). */
+export const MONTHLY_FEE_MANAGER_ROLES: GroupMemberRole[] = [
+  GroupMemberRole.PRESIDENT,
+  GroupMemberRole.VICE_PRESIDENT,
+  GroupMemberRole.TREASURER,
+];
+
+export function canManageMonthlyFees(role: GroupMemberRole): boolean {
+  return MONTHLY_FEE_MANAGER_ROLES.includes(role);
+}

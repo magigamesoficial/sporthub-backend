@@ -45,7 +45,7 @@ app.get("/", (_req: Request, res: Response) => {
   res.json({
     name: "SportHub API",
     version: "0.6.0",
-    docs: "Grupos públicos: GET /groups/preview-code/:code, POST /groups/join-by-code, POST /groups/:id/join-requests; aprovação: GET/POST .../join-requests/:rid/approve|reject. Ver /groups/*, /auth/*, /admin/*.",
+    docs: "Mensalidades: GET/POST /groups/:groupId/fees/:YYYY-MM e .../mark-paid|mark-unpaid. Grupos públicos: preview-code, join-by-code, join-requests. Ver /groups/*, /auth/*, /admin/*.",
   });
 });
 
