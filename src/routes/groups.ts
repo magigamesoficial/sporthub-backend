@@ -20,6 +20,7 @@ import { groupFeePlansRouter } from "./groupFeePlans";
 import { groupFeesRouter } from "./groupFees";
 import { groupGamesRouter } from "./groupGames";
 import { groupLedgerRouter } from "./groupLedger";
+import { groupRankingRouter } from "./groupRanking";
 import { groupScoutSettingsRouter } from "./groupScoutSettings";
 
 export const groupsRouter = Router();
@@ -31,6 +32,7 @@ groupsRouter.use("/:groupId/fee-plans", groupFeePlansRouter);
 groupsRouter.use("/:groupId/games", groupGamesRouter);
 groupsRouter.use("/:groupId/ledger", groupLedgerRouter);
 groupsRouter.use("/:groupId/scout-settings", groupScoutSettingsRouter);
+groupsRouter.use("/:groupId/ranking", groupRankingRouter);
 
 const createGroupSchema = z.object({
   name: z.string().trim().min(2, "Nome do grupo muito curto"),

@@ -57,6 +57,12 @@ enum GameOutcome {
   LOSS
 }
 
+/** Lado do rachão (placar Time A x Time B). */
+enum GameTeamSide {
+  TEAM_A
+  TEAM_B
+}
+
 model User {
   id           String   @id @default(cuid())
   email        String   @unique
@@ -198,6 +204,8 @@ model GroupGame {
   location        String?
   startsAt        DateTime
   outcome         GameOutcome?
+  teamAScore      Int?
+  teamBScore      Int?
   createdByUserId String?
   createdBy       User?         @relation("GamesCreated", fields: [createdByUserId], references: [id], onDelete: SetNull)
   createdAt       DateTime      @default(now())
@@ -216,6 +224,7 @@ model GameAttendance {
   userId    String
   user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
   status    AttendanceStatus
+  teamSide  GameTeamSide?
   updatedAt DateTime         @updatedAt
 
   @@unique([gameId, userId])

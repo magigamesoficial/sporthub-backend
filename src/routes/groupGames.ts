@@ -1,12 +1,14 @@
 import {
   AttendanceStatus,
   GameOutcome,
+  GameTeamSide,
   GroupMemberRole,
   Prisma,
 } from "@prisma/client";
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
-import { canManageGroupGames } from "../lib/groupPermissions";
+import { RESULT_AND_SCOUT_UNLOCK_MS, resultAndScoutUnlocked } from "../lib/gameUnlock";
+import { canAssignGameTeams, canManageGroupGames } from "../lib/groupPermissions";
 import { prisma } from "../lib/prisma";
 
 export const groupGamesRouter = Router({ mergeParams: true });
@@ -26,8 +28,28 @@ const attendanceBodySchema = z.object({
   status: z.nativeEnum(AttendanceStatus),
 });
 
-const patchGameSchema = z.object({
-  outcome: z.union([z.nativeEnum(GameOutcome), z.null()]),
+const patchGameSchema = z.discriminatedUnion("mode", [
+  z.object({
+    mode: z.literal("scores"),
+    teamAScore: z.number().int().min(0),
+    teamBScore: z.number().int().min(0),
+  }),
+  z.object({
+    mode: z.literal("legacy"),
+    outcome: z.nativeEnum(GameOutcome),
+  }),
+  z.object({
+    mode: z.literal("clear"),
+  }),
+]);
+
+const teamAssignmentsBodySchema = z.object({
+  assignments: z.array(
+    z.object({
+      userId: z.string().cuid(),
+      teamSide: z.union([z.nativeEnum(GameTeamSide), z.null()]),
+    }),
+  ),
 });
 
 const scoutStatRowSchema = z.object({
@@ -126,6 +148,8 @@ groupGamesRouter.get("/", async (req: Request, res: Response) => {
         location: g.location,
         startsAt: g.startsAt.toISOString(),
         outcome: g.outcome,
+        teamAScore: g.teamAScore,
+        teamBScore: g.teamBScore,
         createdAt: g.createdAt.toISOString(),
         createdBy: g.createdBy
           ? { id: g.createdBy.id, fullName: g.createdBy.fullName }
@@ -264,6 +288,8 @@ groupGamesRouter.get("/:gameId", async (req: Request, res: Response) => {
       });
     }
 
+    const unlocked = resultAndScoutUnlocked(game.startsAt);
+
     res.json({
       game: {
         id: game.id,
@@ -271,14 +297,21 @@ groupGamesRouter.get("/:gameId", async (req: Request, res: Response) => {
         location: game.location,
         startsAt: game.startsAt.toISOString(),
         outcome: game.outcome,
+        teamAScore: game.teamAScore,
+        teamBScore: game.teamBScore,
         createdAt: game.createdAt.toISOString(),
         createdBy: game.createdBy
           ? { id: game.createdBy.id, fullName: game.createdBy.fullName }
           : null,
+        resultAndScoutUnlocked: unlocked,
+        resultAndScoutUnlocksAt: new Date(
+          game.startsAt.getTime() + RESULT_AND_SCOUT_UNLOCK_MS,
+        ).toISOString(),
       },
       viewer: {
         userId,
         canManageGames: canManageGroupGames(member.role),
+        canAssignTeams: canAssignGameTeams(member.role),
         myStatus: attByUser.get(userId)?.status ?? null,
       },
       scout: {
@@ -296,7 +329,13 @@ groupGamesRouter.get("/:gameId", async (req: Request, res: Response) => {
           fullName: m.user.fullName,
           phone: m.user.phone,
           role: m.role,
-          attendance: a ? { status: a.status, updatedAt: a.updatedAt.toISOString() } : null,
+          attendance: a
+            ? {
+                status: a.status,
+                teamSide: a.teamSide,
+                updatedAt: a.updatedAt.toISOString(),
+              }
+            : null,
           scoutValues: statsByUser.get(m.userId) ?? [],
         };
       }),
@@ -395,19 +434,60 @@ groupGamesRouter.patch("/:gameId", async (req: Request, res: Response) => {
   }
 
   try {
-    const updated = await prisma.groupGame.updateMany({
+    const game = await prisma.groupGame.findFirst({
       where: { id: gameId, groupId },
-      data: { outcome: parsed.data.outcome },
+      select: { id: true, startsAt: true },
     });
-    if (updated.count === 0) {
+    if (!game) {
       res.status(404).json({ error: "Jogo não encontrado" });
       return;
     }
-    const game = await prisma.groupGame.findFirst({
+    if (!resultAndScoutUnlocked(game.startsAt)) {
+      res.status(403).json({
+        error:
+          "Placar e resultado só podem ser informados a partir de 1 minuto após o horário marcado do jogo.",
+        code: "GAME_EDIT_LOCKED",
+      });
+      return;
+    }
+
+    if (parsed.data.mode === "scores") {
+      await prisma.groupGame.update({
+        where: { id: gameId },
+        data: {
+          teamAScore: parsed.data.teamAScore,
+          teamBScore: parsed.data.teamBScore,
+          outcome: null,
+        },
+      });
+    } else if (parsed.data.mode === "legacy") {
+      await prisma.groupGame.update({
+        where: { id: gameId },
+        data: {
+          outcome: parsed.data.outcome,
+          teamAScore: null,
+          teamBScore: null,
+        },
+      });
+    } else {
+      await prisma.groupGame.update({
+        where: { id: gameId },
+        data: { outcome: null, teamAScore: null, teamBScore: null },
+      });
+    }
+
+    const updated = await prisma.groupGame.findFirst({
       where: { id: gameId, groupId },
-      select: { outcome: true },
+      select: { outcome: true, teamAScore: true, teamBScore: true },
     });
-    res.json({ game: { id: gameId, outcome: game?.outcome ?? null } });
+    res.json({
+      game: {
+        id: gameId,
+        outcome: updated?.outcome ?? null,
+        teamAScore: updated?.teamAScore ?? null,
+        teamBScore: updated?.teamBScore ?? null,
+      },
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Erro ao atualizar jogo";
     res.status(500).json({ error: message });
@@ -442,10 +522,18 @@ groupGamesRouter.put("/:gameId/scout-stats", async (req: Request, res: Response)
 
   const game = await prisma.groupGame.findFirst({
     where: { id: gameId, groupId },
-    select: { id: true },
+    select: { id: true, startsAt: true },
   });
   if (!game) {
     res.status(404).json({ error: "Jogo não encontrado" });
+    return;
+  }
+  if (!resultAndScoutUnlocked(game.startsAt)) {
+    res.status(403).json({
+      error:
+        "Scouts só podem ser lançados a partir de 1 minuto após o horário marcado do jogo.",
+      code: "SCOUT_EDIT_LOCKED",
+    });
     return;
   }
 
@@ -507,6 +595,73 @@ groupGamesRouter.put("/:gameId/scout-stats", async (req: Request, res: Response)
     res.json({ ok: true, saved: parsed.data.stats.length });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Erro ao salvar scouts";
+    res.status(500).json({ error: message });
+  }
+});
+
+groupGamesRouter.put("/:gameId/team-assignments", async (req: Request, res: Response) => {
+  const groupIdParsed = cuidParam.safeParse(req.params.groupId);
+  const gameIdParsed = cuidParam.safeParse(req.params.gameId);
+  if (!groupIdParsed.success || !gameIdParsed.success) {
+    res.status(400).json({ error: "Parâmetros inválidos" });
+    return;
+  }
+  const groupId = groupIdParsed.data;
+  const gameId = gameIdParsed.data;
+  const userId = req.auth!.userId;
+
+  const parsed = teamAssignmentsBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Dados inválidos", details: parsed.error.flatten() });
+    return;
+  }
+
+  const member = await requireGroupMember(groupId, userId);
+  if (!member || !canAssignGameTeams(member.role)) {
+    res.status(403).json({
+      error: "Apenas presidente, vice-presidente ou moderador podem definir times.",
+      code: "TEAM_ASSIGN_FORBIDDEN",
+    });
+    return;
+  }
+
+  const game = await prisma.groupGame.findFirst({
+    where: { id: gameId, groupId },
+    select: { id: true },
+  });
+  if (!game) {
+    res.status(404).json({ error: "Jogo não encontrado" });
+    return;
+  }
+
+  const memberIds = new Set(
+    (await prisma.groupMember.findMany({ where: { groupId }, select: { userId: true } })).map(
+      (m) => m.userId,
+    ),
+  );
+
+  try {
+    let updated = 0;
+    await prisma.$transaction(async (tx) => {
+      for (const a of parsed.data.assignments) {
+        if (!memberIds.has(a.userId)) {
+          throw new Error(`NOT_MEMBER:${a.userId}`);
+        }
+        const r = await tx.gameAttendance.updateMany({
+          where: { gameId, userId: a.userId },
+          data: { teamSide: a.teamSide },
+        });
+        updated += r.count;
+      }
+    });
+    res.json({ ok: true, assignmentsUpdated: updated });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "";
+    if (msg.startsWith("NOT_MEMBER:")) {
+      res.status(400).json({ error: "Usuário não participa deste grupo." });
+      return;
+    }
+    const message = err instanceof Error ? err.message : "Erro ao salvar times";
     res.status(500).json({ error: message });
   }
 });

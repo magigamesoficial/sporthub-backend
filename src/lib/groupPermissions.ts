@@ -38,3 +38,14 @@ export function canManageMonthlyFees(role: GroupMemberRole): boolean {
 export function canManageGroupGames(role: GroupMemberRole): boolean {
   return JOIN_APPROVER_ROLES.includes(role);
 }
+
+/** Definir Time A / B no jogo (tesoureiro não incluído). */
+export const GAME_TEAM_ASSIGNER_ROLES: GroupMemberRole[] = [
+  GroupMemberRole.PRESIDENT,
+  GroupMemberRole.VICE_PRESIDENT,
+  GroupMemberRole.MODERATOR,
+];
+
+export function canAssignGameTeams(role: GroupMemberRole): boolean {
+  return GAME_TEAM_ASSIGNER_ROLES.includes(role);
+}
