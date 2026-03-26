@@ -1,4 +1,9 @@
-import { AttendanceStatus, GroupMemberRole, Prisma } from "@prisma/client";
+import {
+  AttendanceStatus,
+  GameOutcome,
+  GroupMemberRole,
+  Prisma,
+} from "@prisma/client";
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import { canManageGroupGames } from "../lib/groupPermissions";
@@ -21,6 +26,20 @@ const attendanceBodySchema = z.object({
   status: z.nativeEnum(AttendanceStatus),
 });
 
+const patchGameSchema = z.object({
+  outcome: z.union([z.nativeEnum(GameOutcome), z.null()]),
+});
+
+const scoutStatRowSchema = z.object({
+  userId: z.string().cuid(),
+  metricDefinitionId: z.string().cuid(),
+  value: z.number().int().min(0),
+});
+
+const putScoutStatsSchema = z.object({
+  stats: z.array(scoutStatRowSchema),
+});
+
 async function requireGroupMember(
   groupId: string,
   userId: string,
@@ -29,6 +48,14 @@ async function requireGroupMember(
     where: { groupId_userId: { groupId, userId } },
   });
   return m;
+}
+
+async function enabledScoutMetricIds(groupId: string): Promise<string[]> {
+  const rows = await prisma.groupEnabledScout.findMany({
+    where: { groupId },
+    select: { scoutMetricDefinitionId: true },
+  });
+  return rows.map((r) => r.scoutMetricDefinitionId);
 }
 
 groupGamesRouter.get("/", async (req: Request, res: Response) => {
@@ -46,13 +73,21 @@ groupGamesRouter.get("/", async (req: Request, res: Response) => {
     return;
   }
 
-  const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const rawWhen = req.query.when;
+  const whenParam = Array.isArray(rawWhen) ? rawWhen[0] : rawWhen;
+  const listWhen = whenParam === "past" ? "past" : "future";
+  const now = new Date();
+
+  const whereClause =
+    listWhen === "future"
+      ? { groupId, startsAt: { gte: now } }
+      : { groupId, startsAt: { lt: now } };
 
   try {
     const games = await prisma.groupGame.findMany({
-      where: { groupId, startsAt: { gte: since } },
-      orderBy: { startsAt: "asc" },
-      take: 100,
+      where: whereClause,
+      orderBy: { startsAt: listWhen === "future" ? "asc" : "desc" },
+      take: listWhen === "future" ? 100 : 50,
       include: {
         createdBy: { select: { id: true, fullName: true } },
       },
@@ -81,6 +116,7 @@ groupGamesRouter.get("/", async (req: Request, res: Response) => {
     }
 
     res.json({
+      listWhen,
       viewer: {
         canManageGames: canManageGroupGames(member.role),
       },
@@ -89,6 +125,7 @@ groupGamesRouter.get("/", async (req: Request, res: Response) => {
         title: g.title,
         location: g.location,
         startsAt: g.startsAt.toISOString(),
+        outcome: g.outcome,
         createdAt: g.createdAt.toISOString(),
         createdBy: g.createdBy
           ? { id: g.createdBy.id, fullName: g.createdBy.fullName }
@@ -189,7 +226,7 @@ groupGamesRouter.get("/:gameId", async (req: Request, res: Response) => {
       return;
     }
 
-    const [members, attendances] = await Promise.all([
+    const [members, attendances, enabledIds, statRows, groupSport] = await Promise.all([
       prisma.groupMember.findMany({
         where: { groupId },
         include: { user: { select: { id: true, fullName: true, phone: true } } },
@@ -198,9 +235,34 @@ groupGamesRouter.get("/:gameId", async (req: Request, res: Response) => {
       prisma.gameAttendance.findMany({
         where: { gameId },
       }),
+      enabledScoutMetricIds(groupId),
+      prisma.gameScoutStat.findMany({
+        where: { gameId },
+      }),
+      prisma.group.findUnique({
+        where: { id: groupId },
+        select: { sport: true },
+      }),
     ]);
 
+    const metricDefs =
+      groupSport && enabledIds.length > 0
+        ? await prisma.scoutMetricDefinition.findMany({
+            where: { sport: groupSport.sport, id: { in: enabledIds } },
+            orderBy: [{ sortOrder: "asc" }, { label: "asc" }],
+          })
+        : [];
+
     const attByUser = new Map(attendances.map((a) => [a.userId, a]));
+
+    const statsByUser = new Map<string, { metricId: string; value: number }[]>();
+    for (const s of statRows) {
+      if (!statsByUser.has(s.userId)) statsByUser.set(s.userId, []);
+      statsByUser.get(s.userId)!.push({
+        metricId: s.scoutMetricDefinitionId,
+        value: s.value,
+      });
+    }
 
     res.json({
       game: {
@@ -208,6 +270,7 @@ groupGamesRouter.get("/:gameId", async (req: Request, res: Response) => {
         title: game.title,
         location: game.location,
         startsAt: game.startsAt.toISOString(),
+        outcome: game.outcome,
         createdAt: game.createdAt.toISOString(),
         createdBy: game.createdBy
           ? { id: game.createdBy.id, fullName: game.createdBy.fullName }
@@ -218,6 +281,14 @@ groupGamesRouter.get("/:gameId", async (req: Request, res: Response) => {
         canManageGames: canManageGroupGames(member.role),
         myStatus: attByUser.get(userId)?.status ?? null,
       },
+      scout: {
+        enabledMetricIds: enabledIds,
+        optionalMetrics: metricDefs.map((d) => ({
+          id: d.id,
+          key: d.key,
+          label: d.label,
+        })),
+      },
       members: members.map((m) => {
         const a = attByUser.get(m.userId);
         return {
@@ -226,6 +297,7 @@ groupGamesRouter.get("/:gameId", async (req: Request, res: Response) => {
           phone: m.user.phone,
           role: m.role,
           attendance: a ? { status: a.status, updatedAt: a.updatedAt.toISOString() } : null,
+          scoutValues: statsByUser.get(m.userId) ?? [],
         };
       }),
     });
@@ -292,6 +364,149 @@ groupGamesRouter.post("/:gameId/attendance", async (req: Request, res: Response)
       return;
     }
     const message = err instanceof Error ? err.message : "Erro ao salvar presença";
+    res.status(500).json({ error: message });
+  }
+});
+
+groupGamesRouter.patch("/:gameId", async (req: Request, res: Response) => {
+  const groupIdParsed = cuidParam.safeParse(req.params.groupId);
+  const gameIdParsed = cuidParam.safeParse(req.params.gameId);
+  if (!groupIdParsed.success || !gameIdParsed.success) {
+    res.status(400).json({ error: "Parâmetros inválidos" });
+    return;
+  }
+  const groupId = groupIdParsed.data;
+  const gameId = gameIdParsed.data;
+  const userId = req.auth!.userId;
+
+  const parsed = patchGameSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Dados inválidos", details: parsed.error.flatten() });
+    return;
+  }
+
+  const member = await requireGroupMember(groupId, userId);
+  if (!member || !canManageGroupGames(member.role)) {
+    res.status(403).json({
+      error: "Apenas presidente, vice, tesoureiro ou moderador podem registrar resultado.",
+      code: "GAME_OUTCOME_FORBIDDEN",
+    });
+    return;
+  }
+
+  try {
+    const updated = await prisma.groupGame.updateMany({
+      where: { id: gameId, groupId },
+      data: { outcome: parsed.data.outcome },
+    });
+    if (updated.count === 0) {
+      res.status(404).json({ error: "Jogo não encontrado" });
+      return;
+    }
+    const game = await prisma.groupGame.findFirst({
+      where: { id: gameId, groupId },
+      select: { outcome: true },
+    });
+    res.json({ game: { id: gameId, outcome: game?.outcome ?? null } });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Erro ao atualizar jogo";
+    res.status(500).json({ error: message });
+  }
+});
+
+groupGamesRouter.put("/:gameId/scout-stats", async (req: Request, res: Response) => {
+  const groupIdParsed = cuidParam.safeParse(req.params.groupId);
+  const gameIdParsed = cuidParam.safeParse(req.params.gameId);
+  if (!groupIdParsed.success || !gameIdParsed.success) {
+    res.status(400).json({ error: "Parâmetros inválidos" });
+    return;
+  }
+  const groupId = groupIdParsed.data;
+  const gameId = gameIdParsed.data;
+  const userId = req.auth!.userId;
+
+  const parsed = putScoutStatsSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Dados inválidos", details: parsed.error.flatten() });
+    return;
+  }
+
+  const member = await requireGroupMember(groupId, userId);
+  if (!member || !canManageGroupGames(member.role)) {
+    res.status(403).json({
+      error: "Apenas líderes podem lançar scouts.",
+      code: "SCOUT_WRITE_FORBIDDEN",
+    });
+    return;
+  }
+
+  const game = await prisma.groupGame.findFirst({
+    where: { id: gameId, groupId },
+    select: { id: true },
+  });
+  if (!game) {
+    res.status(404).json({ error: "Jogo não encontrado" });
+    return;
+  }
+
+  const allowed = new Set(await enabledScoutMetricIds(groupId));
+  const memberIds = new Set(
+    (await prisma.groupMember.findMany({ where: { groupId }, select: { userId: true } })).map(
+      (m) => m.userId,
+    ),
+  );
+
+  for (const s of parsed.data.stats) {
+    if (!allowed.has(s.metricDefinitionId)) {
+      res.status(400).json({
+        error: "Métrica não habilitada para este grupo.",
+        code: "SCOUT_METRIC_NOT_ENABLED",
+      });
+      return;
+    }
+    if (!memberIds.has(s.userId)) {
+      res.status(400).json({
+        error: "Usuário não participa do grupo.",
+        code: "SCOUT_USER_NOT_MEMBER",
+      });
+      return;
+    }
+  }
+
+  try {
+    await prisma.$transaction(async (tx) => {
+      for (const s of parsed.data.stats) {
+        if (s.value === 0) {
+          await tx.gameScoutStat.deleteMany({
+            where: {
+              gameId,
+              userId: s.userId,
+              scoutMetricDefinitionId: s.metricDefinitionId,
+            },
+          });
+        } else {
+          await tx.gameScoutStat.upsert({
+            where: {
+              gameId_userId_scoutMetricDefinitionId: {
+                gameId,
+                userId: s.userId,
+                scoutMetricDefinitionId: s.metricDefinitionId,
+              },
+            },
+            create: {
+              gameId,
+              userId: s.userId,
+              scoutMetricDefinitionId: s.metricDefinitionId,
+              value: s.value,
+            },
+            update: { value: s.value },
+          });
+        }
+      }
+    });
+    res.json({ ok: true, saved: parsed.data.stats.length });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Erro ao salvar scouts";
     res.status(500).json({ error: message });
   }
 });

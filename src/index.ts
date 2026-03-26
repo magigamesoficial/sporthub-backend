@@ -47,9 +47,9 @@ const PUBLIC_API_BASE =
 app.get("/", (_req: Request, res: Response) => {
   res.json({
     name: "SportHub API",
-    version: "0.6.0",
+    version: "0.7.0",
     publicBaseUrl: PUBLIC_API_BASE,
-    docs: "Jogos: /groups/:groupId/games (CRUD + POST .../:gameId/attendance). Mensalidades: /groups/:groupId/fees/:YYYY-MM. Grupos públicos: preview-code, join-by-code. Ver /groups/*, /auth/*, /admin/*.",
+    docs: "Grupos: GET /groups/browse, GET /groups/:id/public-profile, fee-plans, fees+ledger, scout-settings, jogos (outcome, scout-stats). Admin: /admin/scout-metrics. Ver /groups/*, /auth/*, /admin/*.",
   });
 });
 

@@ -46,6 +46,17 @@ enum AttendanceStatus {
   MAYBE
 }
 
+enum LedgerEntryKind {
+  INCOME
+  EXPENSE
+}
+
+enum GameOutcome {
+  WIN
+  DRAW
+  LOSS
+}
+
 model User {
   id           String   @id @default(cuid())
   email        String   @unique
@@ -68,8 +79,10 @@ model User {
   groupJoinRequests   GroupJoinRequest[]
   monthlyFeesAsMember MemberMonthlyFee[]   @relation("MonthlyFeeMember")
   monthlyFeesRecorded MemberMonthlyFee[]   @relation("FeeRecorder")
-  gamesCreated        GroupGame[]          @relation("GamesCreated")
+  gamesCreated        GroupGame[]           @relation("GamesCreated")
   gameAttendances     GameAttendance[]
+  ledgerEntriesRecorded GroupLedgerEntry[]
+  gameScoutStats      GameScoutStat[]
 
   @@map("users")
 }
@@ -104,8 +117,28 @@ model Group {
   joinRequests      GroupJoinRequest[]
   memberMonthlyFees MemberMonthlyFee[]
   games             GroupGame[]
+  ledgerEntries     GroupLedgerEntry[]
+  feePlans          GroupFeePlan[]
+  enabledScoutMetrics GroupEnabledScout[]
 
   @@map("groups")
+}
+
+/** Plano de mensalidade definido pelo grupo (nome + valor). Cada membro escolhe um plano. */
+model GroupFeePlan {
+  id          String   @id @default(cuid())
+  groupId     String
+  group       Group    @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  name        String   @db.VarChar(80)
+  amountCents Int
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+
+  members     GroupMember[]
+  monthlyFees MemberMonthlyFee[]
+
+  @@index([groupId])
+  @@map("group_fee_plans")
 }
 
 model GroupJoinRequest {
@@ -123,13 +156,15 @@ model GroupJoinRequest {
 }
 
 model GroupMember {
-  id      String          @id @default(cuid())
-  groupId String
-  group   Group           @relation(fields: [groupId], references: [id], onDelete: Cascade)
-  userId  String
-  user    User            @relation(fields: [userId], references: [id], onDelete: Cascade)
-  role    GroupMemberRole
-  joinedAt DateTime       @default(now())
+  id        String          @id @default(cuid())
+  groupId   String
+  group     Group           @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role      GroupMemberRole
+  joinedAt  DateTime        @default(now())
+  feePlanId String?
+  feePlan   GroupFeePlan?   @relation(fields: [feePlanId], references: [id], onDelete: SetNull)
 
   @@unique([groupId, userId])
   @@map("group_members")
@@ -143,9 +178,12 @@ model MemberMonthlyFee {
   userId           String
   user             User     @relation("MonthlyFeeMember", fields: [userId], references: [id], onDelete: Cascade)
   periodMonth      String   @db.VarChar(7)
+  feePlanId        String?
+  feePlan          GroupFeePlan? @relation(fields: [feePlanId], references: [id], onDelete: SetNull)
   paidAt           DateTime @default(now())
   recordedByUserId String?
   recordedBy       User?    @relation("FeeRecorder", fields: [recordedByUserId], references: [id], onDelete: SetNull)
+  ledgerEntry      GroupLedgerEntry?
 
   @@unique([groupId, userId, periodMonth])
   @@index([groupId, periodMonth])
@@ -153,17 +191,19 @@ model MemberMonthlyFee {
 }
 
 model GroupGame {
-  id              String   @id @default(cuid())
+  id              String        @id @default(cuid())
   groupId         String
-  group           Group    @relation(fields: [groupId], references: [id], onDelete: Cascade)
-  title           String   @default("Jogo")
+  group           Group         @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  title           String        @default("Jogo")
   location        String?
   startsAt        DateTime
+  outcome         GameOutcome?
   createdByUserId String?
-  createdBy       User?    @relation("GamesCreated", fields: [createdByUserId], references: [id], onDelete: SetNull)
-  createdAt       DateTime @default(now())
+  createdBy       User?         @relation("GamesCreated", fields: [createdByUserId], references: [id], onDelete: SetNull)
+  createdAt       DateTime      @default(now())
 
   attendances GameAttendance[]
+  scoutStats  GameScoutStat[]
 
   @@index([groupId, startsAt])
   @@map("group_games")
@@ -180,4 +220,66 @@ model GameAttendance {
 
   @@unique([gameId, userId])
   @@map("game_attendances")
+}
+
+/** Lançamento de caixa do grupo (entrada ou saída, em centavos). */
+model GroupLedgerEntry {
+  id                 String           @id @default(cuid())
+  groupId            String
+  group              Group            @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  kind               LedgerEntryKind
+  amountCents        Int
+  description        String           @db.VarChar(500)
+  occurredAt         DateTime
+  recordedByUserId   String?
+  recordedBy         User?            @relation(fields: [recordedByUserId], references: [id], onDelete: SetNull)
+  memberMonthlyFeeId String?          @unique
+  memberMonthlyFee   MemberMonthlyFee? @relation(fields: [memberMonthlyFeeId], references: [id], onDelete: Cascade)
+  createdAt          DateTime         @default(now())
+
+  @@index([groupId, occurredAt])
+  @@map("group_ledger_entries")
+}
+
+/** Métrica opcional de scout por esporte (cadastro admin). Vitórias/empates/etc. são derivadas do resultado do jogo. */
+model ScoutMetricDefinition {
+  id        String   @id @default(cuid())
+  sport     Sport
+  key       String   @db.VarChar(64)
+  label     String   @db.VarChar(120)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  enabledInGroups GroupEnabledScout[]
+  gameStats       GameScoutStat[]
+
+  @@unique([sport, key])
+  @@index([sport])
+  @@map("scout_metric_definitions")
+}
+
+model GroupEnabledScout {
+  id                      String                @id @default(cuid())
+  groupId                 String
+  group                   Group                 @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  scoutMetricDefinitionId String
+  definition              ScoutMetricDefinition @relation(fields: [scoutMetricDefinitionId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, scoutMetricDefinitionId])
+  @@map("group_enabled_scouts")
+}
+
+model GameScoutStat {
+  id                      String                @id @default(cuid())
+  gameId                  String
+  game                    GroupGame             @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  userId                  String
+  user                    User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  scoutMetricDefinitionId String
+  definition              ScoutMetricDefinition @relation(fields: [scoutMetricDefinitionId], references: [id], onDelete: Cascade)
+  value                   Int
+
+  @@unique([gameId, userId, scoutMetricDefinitionId])
+  @@index([gameId])
+  @@map("game_scout_stats")
 }

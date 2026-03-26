@@ -8,19 +8,29 @@ import {
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import { generateUniquePublicCode } from "../lib/groupCode";
-import { canApproveJoinRequests, canInviteByPhone } from "../lib/groupPermissions";
+import {
+  canApproveJoinRequests,
+  canInviteByPhone,
+  canManageMonthlyFees,
+} from "../lib/groupPermissions";
 import { normalizeBrazilPhone } from "../lib/phone";
 import { prisma } from "../lib/prisma";
 import { requireAuth } from "../middleware/auth";
+import { groupFeePlansRouter } from "./groupFeePlans";
 import { groupFeesRouter } from "./groupFees";
 import { groupGamesRouter } from "./groupGames";
+import { groupLedgerRouter } from "./groupLedger";
+import { groupScoutSettingsRouter } from "./groupScoutSettings";
 
 export const groupsRouter = Router();
 
 groupsRouter.use(requireAuth);
 
 groupsRouter.use("/:groupId/fees", groupFeesRouter);
+groupsRouter.use("/:groupId/fee-plans", groupFeePlansRouter);
 groupsRouter.use("/:groupId/games", groupGamesRouter);
+groupsRouter.use("/:groupId/ledger", groupLedgerRouter);
+groupsRouter.use("/:groupId/scout-settings", groupScoutSettingsRouter);
 
 const createGroupSchema = z.object({
   name: z.string().trim().min(2, "Nome do grupo muito curto"),
@@ -261,10 +271,129 @@ groupsRouter.get("/mine", async (req: Request, res: Response) => {
   }
 });
 
+const browseQuerySchema = z.object({
+  q: z.string().optional(),
+  sport: z.nativeEnum(Sport).optional(),
+});
+
+groupsRouter.get("/browse", async (req: Request, res: Response) => {
+  const userId = req.auth!.userId;
+  const parsed = browseQuerySchema.safeParse({
+    q: typeof req.query.q === "string" ? req.query.q.trim() : undefined,
+    sport: typeof req.query.sport === "string" ? req.query.sport : undefined,
+  });
+  if (!parsed.success) {
+    res.status(400).json({ error: "Parâmetros inválidos", details: parsed.error.flatten() });
+    return;
+  }
+
+  const { q, sport } = parsed.data;
+
+  try {
+    const where: Prisma.GroupWhereInput = {};
+    if (sport) where.sport = sport;
+    if (q && q.length > 0) {
+      const digits = q.replace(/\D/g, "").slice(0, 6);
+      const orClause: Prisma.GroupWhereInput[] = [
+        { name: { contains: q, mode: "insensitive" } },
+      ];
+      if (digits.length >= 4) {
+        orClause.push({ publicCode: { contains: digits } });
+      }
+      where.OR = orClause;
+    }
+
+    const groups = await prisma.group.findMany({
+      where,
+      take: 80,
+      orderBy: { name: "asc" },
+      select: {
+        id: true,
+        publicCode: true,
+        name: true,
+        sport: true,
+        visibility: true,
+        presidentId: true,
+        createdAt: true,
+      },
+    });
+
+    if (groups.length === 0) {
+      res.json({ groups: [] });
+      return;
+    }
+
+    const ids = groups.map((g) => g.id);
+    const [myMemberships, allMembers] = await Promise.all([
+      prisma.groupMember.findMany({
+        where: { userId, groupId: { in: ids } },
+        select: { groupId: true },
+      }),
+      prisma.groupMember.findMany({
+        where: { groupId: { in: ids } },
+        include: {
+          user: { select: { id: true, fullName: true } },
+        },
+        orderBy: [{ role: "asc" }, { joinedAt: "asc" }],
+      }),
+    ]);
+
+    const memberMap = new Map<string, typeof allMembers>();
+    for (const m of allMembers) {
+      if (!memberMap.has(m.groupId)) memberMap.set(m.groupId, []);
+      memberMap.get(m.groupId)!.push(m);
+    }
+
+    const mySet = new Set(myMemberships.map((m) => m.groupId));
+
+    const shaped = groups.map((g) => {
+      const raw = memberMap.get(g.id) ?? [];
+      const viewerIsMember = mySet.has(g.id);
+      const isPrivateHidden = g.visibility === GroupVisibility.PRIVATE && !viewerIsMember;
+      const membersPayload = isPrivateHidden
+        ? raw
+            .filter((m) => m.role === GroupMemberRole.PRESIDENT)
+            .map((m) => ({
+              userId: m.userId,
+              fullName: m.user.fullName,
+              role: m.role,
+            }))
+        : raw.map((m) => ({
+            userId: m.userId,
+            fullName: m.user.fullName,
+            role: m.role,
+          }));
+
+      return {
+        id: g.id,
+        publicCode: g.publicCode,
+        name: g.name,
+        sport: g.sport,
+        visibility: g.visibility,
+        presidentId: g.presidentId,
+        createdAt: g.createdAt.toISOString(),
+        viewerIsMember,
+        canRequestJoin:
+          g.visibility === GroupVisibility.PUBLIC && !viewerIsMember,
+        members: membersPayload,
+        memberCount: isPrivateHidden ? null : raw.length,
+      };
+    });
+
+    res.json({ groups: shaped });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Erro ao buscar grupos";
+    res.status(500).json({ error: message });
+  }
+});
+
 const cuidParam = z.string().cuid("ID de grupo inválido");
 
 const inviteBodySchema = z.object({
-  phone: z.string().min(8, "Telefone inválido"),
+  phone: z
+    .string()
+    .transform((s) => s.trim())
+    .pipe(z.string().min(8, "Informe o celular com DDD (ex.: 11987654321)")),
 });
 
 groupsRouter.get("/:groupId/members", async (req: Request, res: Response) => {
@@ -305,6 +434,7 @@ groupsRouter.get("/:groupId/members", async (req: Request, res: Response) => {
             email: true,
           },
         },
+        feePlan: { select: { id: true, name: true, amountCents: true } },
       },
       orderBy: [{ role: "asc" }, { joinedAt: "asc" }],
     });
@@ -315,17 +445,177 @@ groupsRouter.get("/:groupId/members", async (req: Request, res: Response) => {
         role: self.role,
         canInviteByPhone: canInviteByPhone(self.role),
         canApproveJoinRequests: canApproveJoinRequests(self.role),
+        canManageMonthlyFees: canManageMonthlyFees(self.role),
       },
       members: rows.map((m) => ({
         membershipId: m.id,
         userId: m.userId,
         role: m.role,
         joinedAt: m.joinedAt,
+        feePlan: m.feePlan
+          ? {
+              id: m.feePlan.id,
+              name: m.feePlan.name,
+              amountCents: m.feePlan.amountCents,
+            }
+          : null,
         user: m.user,
       })),
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Erro ao listar membros";
+    res.status(500).json({ error: message });
+  }
+});
+
+const feePlanAssignBodySchema = z.object({
+  feePlanId: z.union([z.string().cuid(), z.null()]),
+});
+
+groupsRouter.get("/:groupId/public-profile", async (req: Request, res: Response) => {
+  const groupIdParsed = cuidParam.safeParse(req.params.groupId);
+  if (!groupIdParsed.success) {
+    res.status(400).json({ error: "ID de grupo inválido" });
+    return;
+  }
+  const groupId = groupIdParsed.data;
+  const userId = req.auth!.userId;
+
+  try {
+    const group = await prisma.group.findUnique({
+      where: { id: groupId },
+      select: {
+        id: true,
+        publicCode: true,
+        name: true,
+        sport: true,
+        visibility: true,
+        presidentId: true,
+        createdAt: true,
+      },
+    });
+    if (!group) {
+      res.status(404).json({ error: "Grupo não encontrado" });
+      return;
+    }
+
+    const self = await prisma.groupMember.findUnique({
+      where: { groupId_userId: { groupId, userId } },
+    });
+
+    const allMembers = await prisma.groupMember.findMany({
+      where: { groupId },
+      include: { user: { select: { id: true, fullName: true } } },
+      orderBy: [{ role: "asc" }, { joinedAt: "asc" }],
+    });
+
+    const viewerIsMember = Boolean(self);
+    const isPrivateHidden = group.visibility === GroupVisibility.PRIVATE && !viewerIsMember;
+    const membersPayload = isPrivateHidden
+      ? allMembers
+          .filter((m) => m.role === GroupMemberRole.PRESIDENT)
+          .map((m) => ({
+            userId: m.userId,
+            fullName: m.user.fullName,
+            role: m.role,
+          }))
+      : allMembers.map((m) => ({
+          userId: m.userId,
+          fullName: m.user.fullName,
+          role: m.role,
+        }));
+
+    res.json({
+      group: {
+        id: group.id,
+        publicCode: group.publicCode,
+        name: group.name,
+        sport: group.sport,
+        visibility: group.visibility,
+        presidentId: group.presidentId,
+        createdAt: group.createdAt.toISOString(),
+      },
+      viewerIsMember,
+      canRequestJoin:
+        group.visibility === GroupVisibility.PUBLIC && !viewerIsMember,
+      members: membersPayload,
+      memberCount: isPrivateHidden ? null : allMembers.length,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Erro ao carregar grupo";
+    res.status(500).json({ error: message });
+  }
+});
+
+groupsRouter.patch("/:groupId/members/:targetUserId/fee-plan", async (req: Request, res: Response) => {
+  const groupIdParsed = cuidParam.safeParse(req.params.groupId);
+  const targetParsed = cuidParam.safeParse(req.params.targetUserId);
+  if (!groupIdParsed.success || !targetParsed.success) {
+    res.status(400).json({ error: "Parâmetros inválidos" });
+    return;
+  }
+  const groupId = groupIdParsed.data;
+  const targetUserId = targetParsed.data;
+  const actorId = req.auth!.userId;
+
+  const parsed = feePlanAssignBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Dados inválidos", details: parsed.error.flatten() });
+    return;
+  }
+
+  try {
+    const actorMembership = await prisma.groupMember.findUnique({
+      where: { groupId_userId: { groupId, userId: actorId } },
+    });
+    if (!actorMembership || !canManageMonthlyFees(actorMembership.role)) {
+      res.status(403).json({
+        error: "Apenas presidente, vice ou tesoureiro podem atribuir planos.",
+        code: "FEE_PLAN_ASSIGN_FORBIDDEN",
+      });
+      return;
+    }
+
+    const targetMembership = await prisma.groupMember.findUnique({
+      where: { groupId_userId: { groupId, userId: targetUserId } },
+    });
+    if (!targetMembership) {
+      res.status(404).json({ error: "Membro não encontrado neste grupo" });
+      return;
+    }
+
+    if (parsed.data.feePlanId) {
+      const plan = await prisma.groupFeePlan.findFirst({
+        where: { id: parsed.data.feePlanId, groupId },
+      });
+      if (!plan) {
+        res.status(400).json({ error: "Plano inválido para este grupo" });
+        return;
+      }
+    }
+
+    const updated = await prisma.groupMember.update({
+      where: { id: targetMembership.id },
+      data: { feePlanId: parsed.data.feePlanId },
+      include: {
+        feePlan: { select: { id: true, name: true, amountCents: true } },
+      },
+    });
+
+    res.json({
+      member: {
+        userId: updated.userId,
+        feePlan: updated.feePlan
+          ? {
+              id: updated.feePlan.id,
+              name: updated.feePlan.name,
+              amountCents: updated.feePlan.amountCents,
+            }
+          : null,
+      },
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Erro ao atualizar plano";
     res.status(500).json({ error: message });
   }
 });
@@ -389,7 +679,11 @@ groupsRouter.post("/:groupId/members/invite", async (req: Request, res: Response
     }
 
     if (targetUser.id === actorId) {
-      res.status(400).json({ error: "Você já faz parte do grupo" });
+      res.status(400).json({
+        error:
+          "Informe o celular de outra pessoa. Este número é o da sua conta — você já está no grupo.",
+        code: "INVITE_SELF",
+      });
       return;
     }
 
