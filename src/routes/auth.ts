@@ -202,7 +202,7 @@ authRouter.post("/login", authLoginLimiter, async (req: Request, res: Response) 
     if (user.role === UserRole.ADMIN) {
       res.status(403).json({
         error:
-          "Contas de administrador usam e-mail e senha. Na página de entrar, escolha «Entrar como administrador».",
+          "Contas de administrador não entram com celular nesta rota. Use o acesso indicado pela direção.",
         code: "ADMIN_EMAIL_LOGIN_REQUIRED",
       });
       return;

@@ -100,7 +100,7 @@ async function main() {
         });
         // eslint-disable-next-line no-console
         console.log(
-          `Seed: conta admin criada — login em /login aba «Administrador»: e-mail ${emailNorm} + senha do seed; celular ${phoneNorm} só cadastro.`,
+          `Seed: conta admin criada — login em /admin/login: e-mail ${emailNorm} + senha do seed; celular ${phoneNorm} só cadastro.`,
         );
       } catch (e) {
         // eslint-disable-next-line no-console
