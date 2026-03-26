@@ -12,6 +12,13 @@ enum UserRole {
   ADMIN
 }
 
+/** Bloqueio moderado pela plataforma (ADM). */
+enum AccountStatus {
+  ACTIVE
+  BLOCKED
+  BANNED
+}
+
 enum Sport {
   FOOTBALL
   VOLLEYBALL
@@ -70,7 +77,10 @@ model User {
   passwordHash String
   fullName     String
   birthDate    DateTime @db.Date
-  role         UserRole @default(ATHLETE)
+  role           UserRole       @default(ATHLETE)
+  accountStatus  AccountStatus @default(ACTIVE)
+  moderationReason String?      @db.Text
+  moderatedAt      DateTime?
 
   termsVersion      Int
   privacyVersion    Int
@@ -257,6 +267,8 @@ model ScoutMetricDefinition {
   key       String   @db.VarChar(64)
   label     String   @db.VarChar(120)
   sortOrder Int      @default(0)
+  /** Métrica desativada pelo admin — não entra em jogos/ranking novos; histórico permanece. */
+  isActive  Boolean  @default(true)
   createdAt DateTime @default(now())
 
   enabledInGroups GroupEnabledScout[]
@@ -264,6 +276,7 @@ model ScoutMetricDefinition {
 
   @@unique([sport, key])
   @@index([sport])
+  @@index([sport, isActive])
   @@map("scout_metric_definitions")
 }
 

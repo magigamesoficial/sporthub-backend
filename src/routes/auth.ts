@@ -1,4 +1,4 @@
-import { Prisma } from "@prisma/client";
+import { AccountStatus, Prisma } from "@prisma/client";
 import bcrypt from "bcryptjs";
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
@@ -204,6 +204,21 @@ authRouter.post("/login", authLoginLimiter, async (req: Request, res: Response) 
       res.status(401).json({
         error: "Senha incorreta. Tente novamente.",
         code: "INVALID_PASSWORD",
+      });
+      return;
+    }
+
+    if (user.accountStatus !== AccountStatus.ACTIVE) {
+      res.status(403).json({
+        error:
+          user.accountStatus === AccountStatus.BANNED
+            ? "Esta conta foi banida. Entre em contato com o suporte."
+            : "Esta conta está suspensa. Entre em contato com o suporte.",
+        code:
+          user.accountStatus === AccountStatus.BANNED
+            ? "ACCOUNT_BANNED"
+            : "ACCOUNT_BLOCKED",
+        reason: user.moderationReason,
       });
       return;
     }

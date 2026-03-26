@@ -114,7 +114,11 @@ groupRankingRouter.get("/", async (req: Request, res: Response) => {
     const metricDefs =
       enabledIds.length > 0
         ? await prisma.scoutMetricDefinition.findMany({
-            where: { sport: group.sport, id: { in: enabledIds } },
+            where: {
+              sport: group.sport,
+              id: { in: enabledIds },
+              isActive: true,
+            },
             orderBy: [{ sortOrder: "asc" }, { label: "asc" }],
           })
         : [];
@@ -161,11 +165,13 @@ groupRankingRouter.get("/", async (req: Request, res: Response) => {
       }
     }
 
+    const activeScoutDefIds = new Set(metricDefs.map((d) => d.id));
     for (const s of allStats) {
       const gMeta = gameById.get(s.gameId);
       if (!gMeta) continue;
       if (gMeta.startsAt >= now) continue;
       if (!enabledIds.includes(s.scoutMetricDefinitionId)) continue;
+      if (!activeScoutDefIds.has(s.scoutMetricDefinitionId)) continue;
       const um = scoutTotals.get(s.userId);
       if (!um) continue;
       const prev = um.get(s.scoutMetricDefinitionId) ?? 0;

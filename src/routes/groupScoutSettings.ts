@@ -40,7 +40,7 @@ groupScoutSettingsRouter.get("/", async (req: Request, res: Response) => {
 
     const [catalog, enabled] = await Promise.all([
       prisma.scoutMetricDefinition.findMany({
-        where: { sport: group.sport },
+        where: { sport: group.sport, isActive: true },
         orderBy: [{ sortOrder: "asc" }, { label: "asc" }],
       }),
       prisma.groupEnabledScout.findMany({
@@ -70,6 +70,7 @@ groupScoutSettingsRouter.get("/", async (req: Request, res: Response) => {
         key: d.key,
         label: d.label,
         sortOrder: d.sortOrder,
+        isActive: d.isActive,
         enabled: enabledSet.has(d.id),
       })),
     });
@@ -118,12 +119,13 @@ groupScoutSettingsRouter.put("/", async (req: Request, res: Response) => {
     const ids = bodyParsed.data.enabledMetricDefinitionIds;
     if (ids.length > 0) {
       const defs = await prisma.scoutMetricDefinition.findMany({
-        where: { id: { in: ids }, sport: group.sport },
+        where: { id: { in: ids }, sport: group.sport, isActive: true },
         select: { id: true },
       });
       if (defs.length !== ids.length) {
         res.status(400).json({
-          error: "Alguma métrica não existe ou é de outro esporte.",
+          error:
+            "Alguma métrica não existe, é de outro esporte ou está desativada na plataforma.",
           code: "SCOUT_METRIC_INVALID",
         });
         return;

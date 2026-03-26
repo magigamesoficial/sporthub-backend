@@ -1,11 +1,13 @@
-import type { UserRole } from "@prisma/client";
+import { AccountStatus, type UserRole } from "@prisma/client";
 import type { NextFunction, Request, Response } from "express";
 import jwt from "jsonwebtoken";
 import { verifyAccessToken } from "../lib/jwt";
+import { prisma } from "../lib/prisma";
 
 /**
  * Exige header `Authorization: Bearer <access_token>`.
  * Preenche `req.auth` com `userId` e `role` do payload (assinado pelo servidor).
+ * Contas bloqueadas ou banidas recebem 403 (tokens antigos deixam de valer na prática).
  */
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
   const header = req.headers.authorization;
@@ -26,26 +28,65 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
     return;
   }
 
-  try {
-    const payload = verifyAccessToken(raw);
-    req.auth = {
-      userId: payload.sub,
-      role: payload.role as UserRole,
-    };
-    next();
-  } catch (e) {
-    if (e instanceof jwt.TokenExpiredError) {
+  void (async () => {
+    let payload: { sub: string; role: string };
+    try {
+      payload = verifyAccessToken(raw);
+    } catch (e) {
+      if (e instanceof jwt.TokenExpiredError) {
+        res.status(401).json({
+          error: "Sessão expirada. Faça login novamente.",
+          code: "TOKEN_EXPIRED",
+        });
+        return;
+      }
       res.status(401).json({
-        error: "Sessão expirada. Faça login novamente.",
-        code: "TOKEN_EXPIRED",
+        error: "Token inválido ou corrompido",
+        code: "INVALID_TOKEN",
       });
       return;
     }
-    res.status(401).json({
-      error: "Token inválido ou corrompido",
-      code: "INVALID_TOKEN",
-    });
-  }
+
+    try {
+      const user = await prisma.user.findUnique({
+        where: { id: payload.sub },
+        select: { accountStatus: true, moderationReason: true },
+      });
+      if (!user) {
+        res.status(401).json({
+          error: "Conta não encontrada ou sessão inválida",
+          code: "USER_NOT_FOUND",
+        });
+        return;
+      }
+      if (
+        user.accountStatus === AccountStatus.BLOCKED ||
+        user.accountStatus === AccountStatus.BANNED
+      ) {
+        res.status(403).json({
+          error:
+            user.accountStatus === AccountStatus.BANNED
+              ? "Esta conta foi banida."
+              : "Esta conta está suspensa.",
+          code:
+            user.accountStatus === AccountStatus.BANNED
+              ? "ACCOUNT_BANNED"
+              : "ACCOUNT_BLOCKED",
+          reason: user.moderationReason,
+        });
+        return;
+      }
+
+      req.auth = {
+        userId: payload.sub,
+        role: payload.role as UserRole,
+      };
+      next();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Erro ao validar sessão";
+      res.status(500).json({ error: message });
+    }
+  })();
 }
 
 /**

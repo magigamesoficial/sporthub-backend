@@ -269,10 +269,13 @@ groupGamesRouter.get("/:gameId", async (req: Request, res: Response) => {
       }),
     ]);
 
+    const statMetricIds = [...new Set(statRows.map((s) => s.scoutMetricDefinitionId))];
+    const defIdsForUi = [...new Set([...enabledIds, ...statMetricIds])];
+
     const metricDefs =
-      groupSport && enabledIds.length > 0
+      groupSport && defIdsForUi.length > 0
         ? await prisma.scoutMetricDefinition.findMany({
-            where: { sport: groupSport.sport, id: { in: enabledIds } },
+            where: { sport: groupSport.sport, id: { in: defIdsForUi } },
             orderBy: [{ sortOrder: "asc" }, { label: "asc" }],
           })
         : [];
@@ -320,6 +323,7 @@ groupGamesRouter.get("/:gameId", async (req: Request, res: Response) => {
           id: d.id,
           key: d.key,
           label: d.label,
+          isActive: d.isActive,
         })),
       },
       members: members.map((m) => {
@@ -538,6 +542,12 @@ groupGamesRouter.put("/:gameId/scout-stats", async (req: Request, res: Response)
   }
 
   const allowed = new Set(await enabledScoutMetricIds(groupId));
+  const activeInGroup = await prisma.scoutMetricDefinition.findMany({
+    where: { id: { in: [...allowed] }, isActive: true },
+    select: { id: true },
+  });
+  const allowedActive = new Set(activeInGroup.map((d) => d.id));
+
   const memberIds = new Set(
     (await prisma.groupMember.findMany({ where: { groupId }, select: { userId: true } })).map(
       (m) => m.userId,
@@ -549,6 +559,13 @@ groupGamesRouter.put("/:gameId/scout-stats", async (req: Request, res: Response)
       res.status(400).json({
         error: "Métrica não habilitada para este grupo.",
         code: "SCOUT_METRIC_NOT_ENABLED",
+      });
+      return;
+    }
+    if (!allowedActive.has(s.metricDefinitionId)) {
+      res.status(400).json({
+        error: "Esta métrica está desativada na plataforma e não pode ser alterada.",
+        code: "SCOUT_METRIC_INACTIVE",
       });
       return;
     }

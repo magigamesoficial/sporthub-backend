@@ -1,6 +1,8 @@
-import { Sport, UserRole } from "@prisma/client";
+import { AccountStatus, Sport, UserRole } from "@prisma/client";
+import bcrypt from "bcryptjs";
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
+import { ADMIN_RESET_PASSWORD_PLAIN } from "../lib/adminPasswordReset";
 import { prisma } from "../lib/prisma";
 import { requireAuth, requireRole } from "../middleware/auth";
 
@@ -88,7 +90,12 @@ const createScoutSchema = z.object({
   sortOrder: z.number().int().optional(),
 });
 
-const patchScoutSchema = createScoutSchema.partial().omit({ sport: true, key: true });
+const patchScoutSchema = createScoutSchema
+  .partial()
+  .omit({ sport: true, key: true })
+  .extend({
+    isActive: z.boolean().optional(),
+  });
 
 adminRouter.get("/scout-metrics", async (req: Request, res: Response) => {
   const sportRaw = typeof req.query.sport === "string" ? req.query.sport : undefined;
@@ -163,9 +170,17 @@ adminRouter.patch("/scout-metrics/:id", async (req: Request, res: Response) => {
   }
 
   try {
-    const row = await prisma.scoutMetricDefinition.update({
-      where: { id: id.data },
-      data: parsed.data,
+    const row = await prisma.$transaction(async (tx) => {
+      const updated = await tx.scoutMetricDefinition.update({
+        where: { id: id.data },
+        data: parsed.data,
+      });
+      if (parsed.data.isActive === false) {
+        await tx.groupEnabledScout.deleteMany({
+          where: { scoutMetricDefinitionId: id.data },
+        });
+      }
+      return updated;
     });
     res.json({ metric: row });
   } catch (err: unknown) {
@@ -183,15 +198,110 @@ adminRouter.patch("/scout-metrics/:id", async (req: Request, res: Response) => {
   }
 });
 
-adminRouter.delete("/scout-metrics/:id", async (req: Request, res: Response) => {
-  const id = z.string().cuid().safeParse(req.params.id);
-  if (!id.success) {
+adminRouter.get("/meta/sports", (_req: Request, res: Response) => {
+  res.json({ sports: Object.values(Sport) as Sport[] });
+});
+
+adminRouter.get("/users", async (_req: Request, res: Response) => {
+  try {
+    const users = await prisma.user.findMany({
+      orderBy: { createdAt: "desc" },
+      take: 500,
+      select: {
+        id: true,
+        email: true,
+        phone: true,
+        fullName: true,
+        role: true,
+        accountStatus: true,
+        moderationReason: true,
+        moderatedAt: true,
+        createdAt: true,
+      },
+    });
+    res.json({ users });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Erro ao listar usuários";
+    res.status(500).json({ error: message });
+  }
+});
+
+adminRouter.get("/groups", async (_req: Request, res: Response) => {
+  try {
+    const groups = await prisma.group.findMany({
+      orderBy: { createdAt: "desc" },
+      take: 500,
+      select: {
+        id: true,
+        name: true,
+        publicCode: true,
+        visibility: true,
+        sport: true,
+        createdAt: true,
+        president: {
+          select: { id: true, fullName: true, email: true, phone: true },
+        },
+        _count: { select: { members: true } },
+      },
+    });
+    res.json({ groups });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Erro ao listar grupos";
+    res.status(500).json({ error: message });
+  }
+});
+
+const accountStatusBodySchema = z.discriminatedUnion("accountStatus", [
+  z.object({
+    accountStatus: z.literal(AccountStatus.ACTIVE),
+    reason: z.string().optional(),
+  }),
+  z.object({
+    accountStatus: z.literal(AccountStatus.BLOCKED),
+    reason: z.string().trim().min(3, "Motivo obrigatório (mín. 3 caracteres)"),
+  }),
+  z.object({
+    accountStatus: z.literal(AccountStatus.BANNED),
+    reason: z.string().trim().min(3, "Motivo obrigatório (mín. 3 caracteres)"),
+  }),
+]);
+
+adminRouter.patch("/users/:id/account-status", async (req: Request, res: Response) => {
+  const idParsed = z.string().cuid().safeParse(req.params.id);
+  if (!idParsed.success) {
     res.status(400).json({ error: "ID inválido" });
     return;
   }
+  const targetId = idParsed.data;
+  const actorId = req.auth!.userId;
+
+  if (targetId === actorId) {
+    res.status(400).json({
+      error: "Não é possível alterar o status da sua própria conta por aqui.",
+      code: "SELF_FORBIDDEN",
+    });
+    return;
+  }
+
+  const parsed = accountStatusBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Dados inválidos", details: parsed.error.flatten() });
+    return;
+  }
+
+  const now = new Date();
+  const moderationReason =
+    parsed.data.accountStatus === AccountStatus.ACTIVE ? null : parsed.data.reason;
 
   try {
-    await prisma.scoutMetricDefinition.delete({ where: { id: id.data } });
+    await prisma.user.update({
+      where: { id: targetId },
+      data: {
+        accountStatus: parsed.data.accountStatus,
+        moderationReason,
+        moderatedAt: now,
+      },
+    });
     res.json({ ok: true });
   } catch (err: unknown) {
     if (
@@ -200,10 +310,54 @@ adminRouter.delete("/scout-metrics/:id", async (req: Request, res: Response) => 
       "code" in err &&
       (err as { code: string }).code === "P2025"
     ) {
-      res.status(404).json({ error: "Métrica não encontrada" });
+      res.status(404).json({ error: "Usuário não encontrado" });
       return;
     }
-    const message = err instanceof Error ? err.message : "Erro ao excluir métrica";
+    const message = err instanceof Error ? err.message : "Erro ao atualizar status";
+    res.status(500).json({ error: message });
+  }
+});
+
+adminRouter.post("/users/:id/reset-password", async (req: Request, res: Response) => {
+  const idParsed = z.string().cuid().safeParse(req.params.id);
+  if (!idParsed.success) {
+    res.status(400).json({ error: "ID inválido" });
+    return;
+  }
+  const targetId = idParsed.data;
+  const actorId = req.auth!.userId;
+
+  if (targetId === actorId) {
+    res.status(400).json({
+      error: "Para sua própria conta, altere a senha por um fluxo próprio no futuro.",
+      code: "SELF_FORBIDDEN",
+    });
+    return;
+  }
+
+  const hash = await bcrypt.hash(ADMIN_RESET_PASSWORD_PLAIN, 12);
+
+  try {
+    await prisma.user.update({
+      where: { id: targetId },
+      data: { passwordHash: hash },
+    });
+    res.json({
+      ok: true,
+      temporaryPassword: ADMIN_RESET_PASSWORD_PLAIN,
+      message: `Senha definida para a padrão temporária (${ADMIN_RESET_PASSWORD_PLAIN}).`,
+    });
+  } catch (err: unknown) {
+    if (
+      err &&
+      typeof err === "object" &&
+      "code" in err &&
+      (err as { code: string }).code === "P2025"
+    ) {
+      res.status(404).json({ error: "Usuário não encontrado" });
+      return;
+    }
+    const message = err instanceof Error ? err.message : "Erro ao redefinir senha";
     res.status(500).json({ error: message });
   }
 });
