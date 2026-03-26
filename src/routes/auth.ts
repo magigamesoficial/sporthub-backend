@@ -1,4 +1,4 @@
-import { AccountStatus, Prisma } from "@prisma/client";
+import { AccountStatus, Prisma, UserRole } from "@prisma/client";
 import bcrypt from "bcryptjs";
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
@@ -199,11 +199,89 @@ authRouter.post("/login", authLoginLimiter, async (req: Request, res: Response) 
       return;
     }
 
+    if (user.role === UserRole.ADMIN) {
+      res.status(403).json({
+        error:
+          "Contas de administrador usam e-mail e senha. Na página de entrar, escolha «Entrar como administrador».",
+        code: "ADMIN_EMAIL_LOGIN_REQUIRED",
+      });
+      return;
+    }
+
     const ok = await bcrypt.compare(parsed.data.password, user.passwordHash);
     if (!ok) {
       res.status(401).json({
         error: "Senha incorreta. Tente novamente.",
         code: "INVALID_PASSWORD",
+      });
+      return;
+    }
+
+    if (user.accountStatus !== AccountStatus.ACTIVE) {
+      res.status(403).json({
+        error:
+          user.accountStatus === AccountStatus.BANNED
+            ? "Esta conta foi banida. Entre em contato com o suporte."
+            : "Esta conta está suspensa. Entre em contato com o suporte.",
+        code:
+          user.accountStatus === AccountStatus.BANNED
+            ? "ACCOUNT_BANNED"
+            : "ACCOUNT_BLOCKED",
+        reason: user.moderationReason,
+      });
+      return;
+    }
+
+    const token = signAccessToken({ sub: user.id, role: user.role });
+
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        fullName: user.fullName,
+        email: user.email,
+        phone: user.phone,
+        role: user.role,
+      },
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Erro ao entrar";
+    res.status(500).json({ error: message });
+  }
+});
+
+const adminLoginSchema = z.object({
+  email: z.string().trim().email("E-mail inválido"),
+  password: z.string().min(1, "Senha obrigatória"),
+});
+
+authRouter.post("/admin-login", authLoginLimiter, async (req: Request, res: Response) => {
+  const parsed = adminLoginSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Dados inválidos", details: parsed.error.flatten() });
+    return;
+  }
+
+  const emailNormalized = parsed.data.email.toLowerCase();
+
+  try {
+    const user = await prisma.user.findUnique({
+      where: { email: emailNormalized },
+    });
+
+    if (!user || user.role !== UserRole.ADMIN) {
+      res.status(401).json({
+        error: "E-mail ou senha incorretos.",
+        code: "ADMIN_LOGIN_FAILED",
+      });
+      return;
+    }
+
+    const passwordOk = await bcrypt.compare(parsed.data.password, user.passwordHash);
+    if (!passwordOk) {
+      res.status(401).json({
+        error: "E-mail ou senha incorretos.",
+        code: "ADMIN_LOGIN_FAILED",
       });
       return;
     }

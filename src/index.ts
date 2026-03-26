@@ -49,7 +49,7 @@ app.get("/", (_req: Request, res: Response) => {
     name: "SportHub API",
     version: "0.7.0",
     publicBaseUrl: PUBLIC_API_BASE,
-    docs: "Grupos: /groups/*, jogos, ranking, scouts. Admin (JWT ADMIN): /admin/users, /admin/groups, /admin/legal-documents, /admin/scout-metrics, moderação de contas. Auth: /auth/*, documentos públicos /legal/active.",
+    docs: "Grupos: /groups/*, jogos, ranking, scouts. Admin (JWT ADMIN): /admin/users, /admin/groups, /admin/legal-documents, /admin/scout-metrics, moderação de contas. Auth: /auth/login (atleta, celular), /auth/admin-login (ADMIN, e-mail), /auth/me, cadastro.",
   });
 });
 
