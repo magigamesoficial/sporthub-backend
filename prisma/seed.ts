@@ -10,7 +10,7 @@ const prisma = new PrismaClient();
  * Login de atleta (/login) exige conta com role ATHLETE (ex.: após /cadastro).
  */
 const PLATFORM_ADMIN = {
-  email: "paulo.dionizio@live.com",
+  email: "adminsporthub@gmail.com",
   password: "Sporthub@0411",
   /** Número claramente interno; não reutilize números reais de atletas. */
   phoneDigits: "11900000001",
@@ -61,6 +61,20 @@ async function main() {
 
   if (termsActive && privacyActive) {
     const emailNorm = PLATFORM_ADMIN.email.toLowerCase();
+    /** E-mail que era usado no bootstrap antigo; se ainda existir como ADMIN, migra para `emailNorm`. */
+    const legacyAdminEmail = "paulo.dionizio@live.com".toLowerCase();
+    if (emailNorm !== legacyAdminEmail) {
+      const alreadyNew = await prisma.user.findUnique({ where: { email: emailNorm } });
+      const legacy = await prisma.user.findUnique({ where: { email: legacyAdminEmail } });
+      if (!alreadyNew && legacy?.role === UserRole.ADMIN) {
+        await prisma.user.update({
+          where: { id: legacy.id },
+          data: { email: emailNorm },
+        });
+        // eslint-disable-next-line no-console
+        console.log(`Seed: e-mail do admin migrado de ${legacyAdminEmail} → ${emailNorm}.`);
+      }
+    }
     const phoneNorm = normalizeBrazilPhone(PLATFORM_ADMIN.phoneDigits);
     const passwordHash = await bcrypt.hash(PLATFORM_ADMIN.password, 12);
     const now = new Date();
