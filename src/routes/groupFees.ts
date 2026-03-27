@@ -3,6 +3,13 @@ import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import { canManageMonthlyFees } from "../lib/groupPermissions";
 import { prisma } from "../lib/prisma";
+import {
+  currentYearMonthLocal,
+  findOldestUnpaidPeriod,
+  minYearMonth,
+  pastUnpaidStats,
+  yearMonthFromDate,
+} from "../lib/yearMonth";
 
 export const groupFeesRouter = Router({ mergeParams: true });
 
@@ -33,7 +40,7 @@ groupFeesRouter.get("/:yearMonth", async (req: Request, res: Response) => {
       return;
     }
 
-    const [members, fees] = await Promise.all([
+    const [members, fees, allPaidRows] = await Promise.all([
       prisma.groupMember.findMany({
         where: { groupId },
         include: {
@@ -49,17 +56,45 @@ groupFeesRouter.get("/:yearMonth", async (req: Request, res: Response) => {
           feePlan: { select: { id: true, name: true, amountCents: true } },
         },
       }),
+      prisma.memberMonthlyFee.findMany({
+        where: { groupId },
+        select: { userId: true, periodMonth: true },
+      }),
     ]);
 
     const feeByUser = new Map(fees.map((f) => [f.userId, f]));
+    const paidMonthsByUser = new Map<string, Set<string>>();
+    for (const row of allPaidRows) {
+      let set = paidMonthsByUser.get(row.userId);
+      if (!set) {
+        set = new Set<string>();
+        paidMonthsByUser.set(row.userId, set);
+      }
+      set.add(row.periodMonth);
+    }
+
+    const todayYm = currentYearMonthLocal();
 
     res.json({
       periodMonth,
+      todayYearMonth: todayYm,
       viewer: {
         canManageMonthlyFees: canManageMonthlyFees(self.role),
       },
       rows: members.map((m) => {
-        const f = feeByUser.get(m.userId);
+        const f = feeByUser.get(m.user.id);
+        const joinYm = yearMonthFromDate(m.joinedAt);
+        const paidMonths = paidMonthsByUser.get(m.user.id) ?? new Set<string>();
+        const past =
+          m.feePlanId != null
+            ? pastUnpaidStats(joinYm, periodMonth, todayYm, paidMonths)
+            : { count: 0, oldest: null as string | null };
+        const obligationEnd = minYearMonth(periodMonth, todayYm);
+        const nextUnpaid =
+          m.feePlanId != null
+            ? findOldestUnpaidPeriod(joinYm, obligationEnd, paidMonths)
+            : null;
+
         return {
           userId: m.user.id,
           fullName: m.user.fullName,
@@ -82,6 +117,10 @@ groupFeesRouter.get("/:yearMonth", async (req: Request, res: Response) => {
               }
             : null,
           recordedByName: f?.recordedBy?.fullName ?? null,
+          pastUnpaidMonthsCount: past.count,
+          oldestUnpaidPastMonth: past.oldest,
+          /** Próximo mês que será quitado ao «Marcar pago» (sempre o mais antigo em aberto). */
+          nextPaymentWillApplyToMonth: nextUnpaid,
         };
       }),
     });
@@ -145,16 +184,38 @@ groupFeesRouter.post("/:yearMonth/mark-paid", async (req: Request, res: Response
     }
 
     const plan = targetMembership.feePlan;
+    const joinYm = yearMonthFromDate(targetMembership.joinedAt);
+    const todayYm = currentYearMonthLocal();
+    const obligationEnd = minYearMonth(periodMonth, todayYm);
+
+    const paidRows = await prisma.memberMonthlyFee.findMany({
+      where: { groupId, userId: targetUserId },
+      select: { periodMonth: true },
+    });
+    const paidMonths = new Set(paidRows.map((r) => r.periodMonth));
+    const targetPeriodMonth = findOldestUnpaidPeriod(joinYm, obligationEnd, paidMonths);
+
+    if (!targetPeriodMonth) {
+      res.status(400).json({
+        error: "Não há mensalidade em aberto para este membro até o mês selecionado.",
+        code: "NO_OPEN_FEE",
+      });
+      return;
+    }
 
     const row = await prisma.$transaction(async (tx) => {
       const fee = await tx.memberMonthlyFee.upsert({
         where: {
-          groupId_userId_periodMonth: { groupId, userId: targetUserId, periodMonth },
+          groupId_userId_periodMonth: {
+            groupId,
+            userId: targetUserId,
+            periodMonth: targetPeriodMonth,
+          },
         },
         create: {
           groupId,
           userId: targetUserId,
-          periodMonth,
+          periodMonth: targetPeriodMonth,
           feePlanId: plan.id,
           recordedByUserId: actorId,
         },
@@ -165,7 +226,7 @@ groupFeesRouter.post("/:yearMonth/mark-paid", async (req: Request, res: Response
         },
       });
 
-      const desc = `Mensalidade (${plan.name}) — ${targetMembership.user.fullName} — ${periodMonth}`;
+      const desc = `Mensalidade (${plan.name}) — ${targetMembership.user.fullName} — ${targetPeriodMonth}`;
       const existing = await tx.groupLedgerEntry.findUnique({
         where: { memberMonthlyFeeId: fee.id },
       });
@@ -203,6 +264,9 @@ groupFeesRouter.post("/:yearMonth/mark-paid", async (req: Request, res: Response
         paidAt: row.paidAt.toISOString(),
         feePlanId: plan.id,
       },
+      /** Mês efetivamente quitado (FIFO: sempre o mais antigo em aberto). */
+      appliedPeriodMonth: targetPeriodMonth,
+      viewedPeriodMonth: periodMonth,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Erro ao registrar pagamento";
