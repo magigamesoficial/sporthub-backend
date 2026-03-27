@@ -4,12 +4,16 @@ import { normalizeBrazilPhone } from "../src/lib/phone";
 
 const prisma = new PrismaClient();
 
-/** Conta bootstrap do painel ADM (login na app é pelo celular, não pelo e-mail). */
+/**
+ * Conta bootstrap do painel ADM em /admin/login (e-mail + senha).
+ * O celular é só para cumprir @unique no banco — não use para login de atleta nem reserve para testes.
+ * Login de atleta (/login) exige conta com role ATHLETE (ex.: após /cadastro).
+ */
 const PLATFORM_ADMIN = {
   email: "paulo.dionizio@live.com",
   password: "Sporthub@0411",
-  /** DDD + número usados em /login — altere aqui se precisar outro. */
-  phoneDigits: "47988169663",
+  /** Número claramente interno; não reutilize números reais de atletas. */
+  phoneDigits: "11900000001",
   fullName: "Paulo Dionizio",
 } as const;
 
