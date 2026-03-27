@@ -49,3 +49,8 @@ export const GAME_TEAM_ASSIGNER_ROLES: GroupMemberRole[] = [
 export function canAssignGameTeams(role: GroupMemberRole): boolean {
   return GAME_TEAM_ASSIGNER_ROLES.includes(role);
 }
+
+/** Presidente, vice, tesoureiro e moderadores: editam configurações do grupo (e scouts). */
+export function canEditGroupSettings(role: GroupMemberRole): boolean {
+  return JOIN_APPROVER_ROLES.includes(role);
+}

@@ -126,6 +126,12 @@ model Group {
   sport       Sport
   presidentId String
   president   User            @relation("PresidentGroups", fields: [presidentId], references: [id])
+  /** Link opcional do estatuto ou regulamento externo. */
+  statuteUrl        String? @db.VarChar(2000)
+  /** Regras / observações locais do grupo (texto livre). */
+  localRulesNote    String? @db.Text
+  /** Se verdadeiro e o grupo for público, a página «ver perfil» exibe planos, situação de mensalidade etc. */
+  richPublicProfile Boolean @default(false)
   createdAt   DateTime        @default(now())
   updatedAt   DateTime        @updatedAt
 

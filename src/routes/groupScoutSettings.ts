@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
-import { canManageGroupGames } from "../lib/groupPermissions";
+import { canEditGroupSettings } from "../lib/groupPermissions";
 import { prisma } from "../lib/prisma";
 
 export const groupScoutSettingsRouter = Router({ mergeParams: true });
@@ -53,7 +53,7 @@ groupScoutSettingsRouter.get("/", async (req: Request, res: Response) => {
 
     res.json({
       viewer: {
-        canConfigure: canManageGroupGames(member.role),
+        canConfigure: canEditGroupSettings(member.role),
       },
       sport: group.sport,
       /** Estatísticas de ranking derivadas do resultado do jogo (sempre disponíveis). */
@@ -98,7 +98,7 @@ groupScoutSettingsRouter.put("/", async (req: Request, res: Response) => {
   const member = await prisma.groupMember.findUnique({
     where: { groupId_userId: { groupId, userId } },
   });
-  if (!member || !canManageGroupGames(member.role)) {
+  if (!member || !canEditGroupSettings(member.role)) {
     res.status(403).json({
       error: "Apenas presidente, vice, tesoureiro ou moderador podem configurar scouts.",
       code: "SCOUT_CONFIG_FORBIDDEN",

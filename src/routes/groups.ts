@@ -10,6 +10,7 @@ import { z } from "zod";
 import { generateUniquePublicCode } from "../lib/groupCode";
 import {
   canApproveJoinRequests,
+  canEditGroupSettings,
   canInviteByPhone,
   canManageMonthlyFees,
 } from "../lib/groupPermissions";
@@ -24,6 +25,14 @@ import { groupRankingRouter } from "./groupRanking";
 import { groupScoutSettingsRouter } from "./groupScoutSettings";
 
 export const groupsRouter = Router();
+
+/** Mês corrente no fuso do servidor (YYYY-MM), alinhado às rotas de mensalidade. */
+function currentPeriodMonth(): string {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  return `${y}-${m}`;
+}
 
 groupsRouter.use(requireAuth);
 
@@ -411,6 +420,16 @@ const inviteBodySchema = z.object({
     .pipe(z.string().min(8, "Informe o celular com DDD (ex.: 11987654321)")),
 });
 
+const groupSettingsPatchSchema = z.object({
+  statuteUrl: z.union([z.string().url().max(2000), z.literal(""), z.null()]).optional(),
+  localRulesNote: z.union([z.string().max(20_000), z.literal(""), z.null()]).optional(),
+  richPublicProfile: z.boolean().optional(),
+});
+
+const memberRolePatchSchema = z.object({
+  role: z.nativeEnum(GroupMemberRole),
+});
+
 groupsRouter.get("/:groupId/members", async (req: Request, res: Response) => {
   const groupIdParsed = cuidParam.safeParse(req.params.groupId);
   if (!groupIdParsed.success) {
@@ -461,6 +480,7 @@ groupsRouter.get("/:groupId/members", async (req: Request, res: Response) => {
         canInviteByPhone: canInviteByPhone(self.role),
         canApproveJoinRequests: canApproveJoinRequests(self.role),
         canManageMonthlyFees: canManageMonthlyFees(self.role),
+        canEditGroupSettings: canEditGroupSettings(self.role),
       },
       members: rows.map((m) => ({
         membershipId: m.id,
@@ -487,6 +507,284 @@ const feePlanAssignBodySchema = z.object({
   feePlanId: z.union([z.string().cuid(), z.null()]),
 });
 
+groupsRouter.get("/:groupId/settings", async (req: Request, res: Response) => {
+  const groupIdParsed = cuidParam.safeParse(req.params.groupId);
+  if (!groupIdParsed.success) {
+    res.status(400).json({ error: "ID de grupo inválido" });
+    return;
+  }
+  const groupId = groupIdParsed.data;
+  const userId = req.auth!.userId;
+  const periodMonth = currentPeriodMonth();
+
+  try {
+    const group = await prisma.group.findUnique({
+      where: { id: groupId },
+      select: {
+        id: true,
+        name: true,
+        sport: true,
+        visibility: true,
+        statuteUrl: true,
+        localRulesNote: true,
+        richPublicProfile: true,
+        presidentId: true,
+      },
+    });
+    if (!group) {
+      res.status(404).json({ error: "Grupo não encontrado" });
+      return;
+    }
+
+    const self = await prisma.groupMember.findUnique({
+      where: { groupId_userId: { groupId, userId } },
+    });
+    if (!self) {
+      res.status(403).json({ error: "Você não participa deste grupo" });
+      return;
+    }
+
+    const [members, fees, plans] = await Promise.all([
+      prisma.groupMember.findMany({
+        where: { groupId },
+        include: {
+          user: { select: { id: true, fullName: true, phone: true, email: true } },
+          feePlan: { select: { id: true, name: true, amountCents: true } },
+        },
+        orderBy: [{ role: "asc" }, { joinedAt: "asc" }],
+      }),
+      prisma.memberMonthlyFee.findMany({
+        where: { groupId, periodMonth },
+        select: { userId: true },
+      }),
+      prisma.groupFeePlan.findMany({
+        where: { groupId },
+        orderBy: { name: "asc" },
+        select: { id: true, name: true, amountCents: true },
+      }),
+    ]);
+
+    const paidUserIds = new Set(fees.map((f) => f.userId));
+
+    type FeeStatus = "em_dia" | "em_atraso" | "sem_plano";
+    function feeStatusForMember(m: (typeof members)[0]): FeeStatus {
+      if (!m.feePlanId) return "sem_plano";
+      return paidUserIds.has(m.userId) ? "em_dia" : "em_atraso";
+    }
+
+    res.json({
+      periodMonth,
+      group: {
+        id: group.id,
+        name: group.name,
+        sport: group.sport,
+        visibility: group.visibility,
+        statuteUrl: group.statuteUrl,
+        localRulesNote: group.localRulesNote,
+        richPublicProfile: group.richPublicProfile,
+        presidentId: group.presidentId,
+      },
+      viewer: {
+        canEditSettings: canEditGroupSettings(self.role),
+      },
+      feePlans: plans.map((p) => ({
+        id: p.id,
+        name: p.name,
+        amountCents: p.amountCents,
+      })),
+      members: members.map((m) => ({
+        userId: m.userId,
+        fullName: m.user.fullName,
+        role: m.role,
+        feePlan: m.feePlan
+          ? { id: m.feePlan.id, name: m.feePlan.name, amountCents: m.feePlan.amountCents }
+          : null,
+        feeStatus: feeStatusForMember(m),
+        phone: m.user.phone,
+        email: m.user.email,
+      })),
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Erro ao carregar configurações";
+    res.status(500).json({ error: message });
+  }
+});
+
+groupsRouter.patch("/:groupId/settings", async (req: Request, res: Response) => {
+  const groupIdParsed = cuidParam.safeParse(req.params.groupId);
+  if (!groupIdParsed.success) {
+    res.status(400).json({ error: "ID de grupo inválido" });
+    return;
+  }
+  const groupId = groupIdParsed.data;
+  const actorId = req.auth!.userId;
+
+  const parsed = groupSettingsPatchSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Dados inválidos", details: parsed.error.flatten() });
+    return;
+  }
+
+  if (Object.keys(parsed.data).length === 0) {
+    res.status(400).json({ error: "Nenhum campo para atualizar" });
+    return;
+  }
+
+  try {
+    const actorMembership = await prisma.groupMember.findUnique({
+      where: { groupId_userId: { groupId, userId: actorId } },
+    });
+    if (!actorMembership || !canEditGroupSettings(actorMembership.role)) {
+      res.status(403).json({
+        error: "Apenas presidente, vice, tesoureiro ou moderador alteram estas configurações.",
+        code: "GROUP_SETTINGS_FORBIDDEN",
+      });
+      return;
+    }
+
+    const group = await prisma.group.findUnique({
+      where: { id: groupId },
+      select: { id: true },
+    });
+    if (!group) {
+      res.status(404).json({ error: "Grupo não encontrado" });
+      return;
+    }
+
+    const data: Prisma.GroupUpdateInput = {};
+    if (parsed.data.statuteUrl !== undefined) {
+      const v = parsed.data.statuteUrl;
+      data.statuteUrl = v === "" || v === null ? null : v;
+    }
+    if (parsed.data.localRulesNote !== undefined) {
+      const v = parsed.data.localRulesNote;
+      data.localRulesNote = v === "" || v === null ? null : v;
+    }
+    if (parsed.data.richPublicProfile !== undefined) {
+      data.richPublicProfile = parsed.data.richPublicProfile;
+    }
+
+    const updated = await prisma.group.update({
+      where: { id: groupId },
+      data,
+      select: {
+        statuteUrl: true,
+        localRulesNote: true,
+        richPublicProfile: true,
+      },
+    });
+
+    res.json({ group: updated });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Erro ao salvar configurações";
+    res.status(500).json({ error: message });
+  }
+});
+
+groupsRouter.patch("/:groupId/members/:targetUserId/role", async (req: Request, res: Response) => {
+  const groupIdParsed = cuidParam.safeParse(req.params.groupId);
+  const targetParsed = cuidParam.safeParse(req.params.targetUserId);
+  if (!groupIdParsed.success || !targetParsed.success) {
+    res.status(400).json({ error: "Parâmetros inválidos" });
+    return;
+  }
+  const groupId = groupIdParsed.data;
+  const targetUserId = targetParsed.data;
+  const actorId = req.auth!.userId;
+
+  const parsed = memberRolePatchSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Dados inválidos", details: parsed.error.flatten() });
+    return;
+  }
+  const newRole = parsed.data.role;
+
+  try {
+    const actorMembership = await prisma.groupMember.findUnique({
+      where: { groupId_userId: { groupId, userId: actorId } },
+    });
+    if (!actorMembership || !canEditGroupSettings(actorMembership.role)) {
+      res.status(403).json({
+        error: "Apenas presidente, vice, tesoureiro ou moderador atribuem papéis de direção.",
+        code: "MEMBER_ROLE_FORBIDDEN",
+      });
+      return;
+    }
+
+    const targetMembership = await prisma.groupMember.findUnique({
+      where: { groupId_userId: { groupId, userId: targetUserId } },
+    });
+    if (!targetMembership) {
+      res.status(404).json({ error: "Membro não encontrado neste grupo" });
+      return;
+    }
+
+    if (
+      targetMembership.role === GroupMemberRole.PRESIDENT &&
+      newRole !== GroupMemberRole.PRESIDENT
+    ) {
+      res.status(400).json({
+        error:
+          "Para alterar o papel do presidente atual, atribua primeiro a presidência a outro membro.",
+        code: "PRESIDENT_TRANSFER_REQUIRED",
+      });
+      return;
+    }
+
+    await prisma.$transaction(async (tx) => {
+      if (newRole === GroupMemberRole.PRESIDENT) {
+        await tx.groupMember.updateMany({
+          where: { groupId, role: GroupMemberRole.PRESIDENT },
+          data: { role: GroupMemberRole.MEMBER },
+        });
+        await tx.groupMember.update({
+          where: { groupId_userId: { groupId, userId: targetUserId } },
+          data: { role: GroupMemberRole.PRESIDENT },
+        });
+        await tx.group.update({
+          where: { id: groupId },
+          data: { presidentId: targetUserId },
+        });
+        return;
+      }
+
+      if (newRole === GroupMemberRole.VICE_PRESIDENT) {
+        await tx.groupMember.updateMany({
+          where: { groupId, role: GroupMemberRole.VICE_PRESIDENT },
+          data: { role: GroupMemberRole.MEMBER },
+        });
+        await tx.groupMember.update({
+          where: { groupId_userId: { groupId, userId: targetUserId } },
+          data: { role: GroupMemberRole.VICE_PRESIDENT },
+        });
+        return;
+      }
+
+      if (newRole === GroupMemberRole.TREASURER) {
+        await tx.groupMember.updateMany({
+          where: { groupId, role: GroupMemberRole.TREASURER },
+          data: { role: GroupMemberRole.MEMBER },
+        });
+        await tx.groupMember.update({
+          where: { groupId_userId: { groupId, userId: targetUserId } },
+          data: { role: GroupMemberRole.TREASURER },
+        });
+        return;
+      }
+
+      await tx.groupMember.update({
+        where: { groupId_userId: { groupId, userId: targetUserId } },
+        data: { role: newRole },
+      });
+    });
+
+    res.json({ ok: true, userId: targetUserId, role: newRole });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Erro ao atualizar o papel";
+    res.status(500).json({ error: message });
+  }
+});
+
 groupsRouter.get("/:groupId/public-profile", async (req: Request, res: Response) => {
   const groupIdParsed = cuidParam.safeParse(req.params.groupId);
   if (!groupIdParsed.success) {
@@ -507,6 +805,9 @@ groupsRouter.get("/:groupId/public-profile", async (req: Request, res: Response)
         visibility: true,
         presidentId: true,
         createdAt: true,
+        statuteUrl: true,
+        localRulesNote: true,
+        richPublicProfile: true,
       },
     });
     if (!group) {
@@ -549,6 +850,51 @@ groupsRouter.get("/:groupId/public-profile", async (req: Request, res: Response)
       ? allMembers.filter((m) => m.role === GroupMemberRole.PRESIDENT).map(mapMember)
       : allMembers.map(mapMember);
 
+    const showRichPublic =
+      group.richPublicProfile &&
+      !isPrivateHidden &&
+      (group.visibility === GroupVisibility.PUBLIC || viewerIsMember);
+
+    type PublicMemberPayload = (typeof membersPayload)[0] & {
+      feeStatus?: "em_dia" | "em_atraso" | "sem_plano";
+    };
+    let enrichedMembers: PublicMemberPayload[] = membersPayload;
+    let feePlansPayload:
+      | { id: string; name: string; amountCents: number }[]
+      | undefined;
+
+    let richPeriodMonth: string | undefined;
+    if (showRichPublic) {
+      richPeriodMonth = currentPeriodMonth();
+      const [fees, plans] = await Promise.all([
+        prisma.memberMonthlyFee.findMany({
+          where: { groupId, periodMonth: richPeriodMonth },
+          select: { userId: true },
+        }),
+        prisma.groupFeePlan.findMany({
+          where: { groupId },
+          orderBy: { name: "asc" },
+          select: { id: true, name: true, amountCents: true },
+        }),
+      ]);
+      const paid = new Set(fees.map((f) => f.userId));
+      const byUserId = new Map(allMembers.map((m) => [m.userId, m]));
+      feePlansPayload = plans.map((p) => ({
+        id: p.id,
+        name: p.name,
+        amountCents: p.amountCents,
+      }));
+      enrichedMembers = membersPayload.map((row) => {
+        const m = byUserId.get(row.userId);
+        let feeStatus: "em_dia" | "em_atraso" | "sem_plano" = "sem_plano";
+        if (m) {
+          if (!m.feePlanId) feeStatus = "sem_plano";
+          else feeStatus = paid.has(m.userId) ? "em_dia" : "em_atraso";
+        }
+        return { ...row, feeStatus };
+      });
+    }
+
     res.json({
       group: {
         id: group.id,
@@ -558,13 +904,23 @@ groupsRouter.get("/:groupId/public-profile", async (req: Request, res: Response)
         visibility: group.visibility,
         presidentId: group.presidentId,
         createdAt: group.createdAt.toISOString(),
+        richPublicProfile: group.richPublicProfile,
+        ...(showRichPublic
+          ? {
+              statuteUrl: group.statuteUrl,
+              localRulesNote: group.localRulesNote,
+            }
+          : {}),
       },
       viewerIsMember,
       viewerPendingJoinRequestId: pendingSelf?.id ?? null,
       canRequestJoin:
         group.visibility === GroupVisibility.PUBLIC && !viewerIsMember,
-      members: membersPayload,
+      members: enrichedMembers,
       memberCount: isPrivateHidden ? null : allMembers.length,
+      ...(showRichPublic && feePlansPayload && richPeriodMonth
+        ? { periodMonth: richPeriodMonth, feePlans: feePlansPayload }
+        : {}),
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Erro ao carregar grupo";
