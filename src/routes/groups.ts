@@ -326,7 +326,7 @@ groupsRouter.get("/browse", async (req: Request, res: Response) => {
     }
 
     const ids = groups.map((g) => g.id);
-    const [myMemberships, allMembers] = await Promise.all([
+    const [myMemberships, allMembers, myPendingJoins] = await Promise.all([
       prisma.groupMember.findMany({
         where: { userId, groupId: { in: ids } },
         select: { groupId: true },
@@ -335,8 +335,17 @@ groupsRouter.get("/browse", async (req: Request, res: Response) => {
         where: { groupId: { in: ids } },
         include: {
           user: { select: { id: true, fullName: true } },
+          feePlan: { select: { name: true } },
         },
         orderBy: [{ role: "asc" }, { joinedAt: "asc" }],
+      }),
+      prisma.groupJoinRequest.findMany({
+        where: {
+          userId,
+          groupId: { in: ids },
+          status: JoinRequestStatus.PENDING,
+        },
+        select: { groupId: true, id: true },
       }),
     ]);
 
@@ -347,6 +356,7 @@ groupsRouter.get("/browse", async (req: Request, res: Response) => {
     }
 
     const mySet = new Set(myMemberships.map((m) => m.groupId));
+    const pendingJoinByGroup = new Map(myPendingJoins.map((r) => [r.groupId, r.id]));
 
     const shaped = groups.map((g) => {
       const raw = memberMap.get(g.id) ?? [];
@@ -359,11 +369,13 @@ groupsRouter.get("/browse", async (req: Request, res: Response) => {
               userId: m.userId,
               fullName: m.user.fullName,
               role: m.role,
+              feePlanName: m.feePlan?.name ?? null,
             }))
         : raw.map((m) => ({
             userId: m.userId,
             fullName: m.user.fullName,
             role: m.role,
+            feePlanName: m.feePlan?.name ?? null,
           }));
 
       return {
@@ -375,6 +387,7 @@ groupsRouter.get("/browse", async (req: Request, res: Response) => {
         presidentId: g.presidentId,
         createdAt: g.createdAt.toISOString(),
         viewerIsMember,
+        viewerPendingJoinRequestId: pendingJoinByGroup.get(g.id) ?? null,
         canRequestJoin:
           g.visibility === GroupVisibility.PUBLIC && !viewerIsMember,
         members: membersPayload,
@@ -505,27 +518,36 @@ groupsRouter.get("/:groupId/public-profile", async (req: Request, res: Response)
       where: { groupId_userId: { groupId, userId } },
     });
 
-    const allMembers = await prisma.groupMember.findMany({
-      where: { groupId },
-      include: { user: { select: { id: true, fullName: true } } },
-      orderBy: [{ role: "asc" }, { joinedAt: "asc" }],
-    });
+    const [allMembers, pendingSelf] = await Promise.all([
+      prisma.groupMember.findMany({
+        where: { groupId },
+        include: {
+          user: { select: { id: true, fullName: true, phone: true } },
+          feePlan: { select: { name: true } },
+        },
+        orderBy: [{ role: "asc" }, { joinedAt: "asc" }],
+      }),
+      prisma.groupJoinRequest.findFirst({
+        where: { groupId, userId, status: JoinRequestStatus.PENDING },
+        select: { id: true },
+      }),
+    ]);
 
     const viewerIsMember = Boolean(self);
     const isPrivateHidden = group.visibility === GroupVisibility.PRIVATE && !viewerIsMember;
+    const mapMember = (m: (typeof allMembers)[0]) => ({
+      userId: m.userId,
+      fullName: m.user.fullName,
+      role: m.role,
+      feePlanName: m.feePlan?.name ?? null,
+      whatsappPhone:
+        m.role === GroupMemberRole.PRESIDENT || m.role === GroupMemberRole.VICE_PRESIDENT
+          ? m.user.phone
+          : null,
+    });
     const membersPayload = isPrivateHidden
-      ? allMembers
-          .filter((m) => m.role === GroupMemberRole.PRESIDENT)
-          .map((m) => ({
-            userId: m.userId,
-            fullName: m.user.fullName,
-            role: m.role,
-          }))
-      : allMembers.map((m) => ({
-          userId: m.userId,
-          fullName: m.user.fullName,
-          role: m.role,
-        }));
+      ? allMembers.filter((m) => m.role === GroupMemberRole.PRESIDENT).map(mapMember)
+      : allMembers.map(mapMember);
 
     res.json({
       group: {
@@ -538,6 +560,7 @@ groupsRouter.get("/:groupId/public-profile", async (req: Request, res: Response)
         createdAt: group.createdAt.toISOString(),
       },
       viewerIsMember,
+      viewerPendingJoinRequestId: pendingSelf?.id ?? null,
       canRequestJoin:
         group.visibility === GroupVisibility.PUBLIC && !viewerIsMember,
       members: membersPayload,
@@ -785,6 +808,34 @@ groupsRouter.post("/:groupId/join-requests", async (req: Request, res: Response)
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Erro ao solicitar entrada";
+    res.status(500).json({ error: message });
+  }
+});
+
+/** Atleta cancela o próprio pedido pendente de entrada no grupo público. */
+groupsRouter.delete("/:groupId/join-requests/me", async (req: Request, res: Response) => {
+  const groupIdParsed = cuidParam.safeParse(req.params.groupId);
+  if (!groupIdParsed.success) {
+    res.status(400).json({ error: "ID de grupo inválido" });
+    return;
+  }
+  const groupId = groupIdParsed.data;
+  const userId = req.auth!.userId;
+
+  try {
+    const del = await prisma.groupJoinRequest.deleteMany({
+      where: { groupId, userId, status: JoinRequestStatus.PENDING },
+    });
+    if (del.count === 0) {
+      res.status(404).json({
+        error: "Não há solicitação pendente para cancelar.",
+        code: "NO_PENDING_REQUEST",
+      });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Erro ao cancelar pedido";
     res.status(500).json({ error: message });
   }
 });
