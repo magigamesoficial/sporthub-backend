@@ -3,6 +3,7 @@ import bcrypt from "bcryptjs";
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import { ADMIN_RESET_PASSWORD_PLAIN } from "../lib/adminPasswordReset";
+import { normalizeBrazilPhone } from "../lib/phone";
 import { prisma } from "../lib/prisma";
 import { requireAuth, requireRole } from "../middleware/auth";
 
@@ -212,11 +213,17 @@ adminRouter.get("/users", async (_req: Request, res: Response) => {
         email: true,
         phone: true,
         fullName: true,
+        birthDate: true,
         role: true,
         accountStatus: true,
         moderationReason: true,
         moderatedAt: true,
+        termsVersion: true,
+        privacyVersion: true,
+        termsAcceptedAt: true,
+        privacyAcceptedAt: true,
         createdAt: true,
+        updatedAt: true,
       },
     });
     res.json({ users });
@@ -265,6 +272,187 @@ const accountStatusBodySchema = z.discriminatedUnion("accountStatus", [
     reason: z.string().trim().min(3, "Motivo obrigatório (mín. 3 caracteres)"),
   }),
 ]);
+
+const patchUserBodySchema = z
+  .object({
+    email: z.string().trim().email("E-mail inválido"),
+    phone: z.string().min(8, "Telefone inválido"),
+    fullName: z.string().trim().min(2, "Nome muito curto"),
+    birthDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Nascimento use AAAA-MM-DD"),
+    role: z.nativeEnum(UserRole),
+    accountStatus: z.nativeEnum(AccountStatus),
+    moderationReason: z.string().nullable().optional(),
+    moderatedAt: z.union([z.string().datetime(), z.null()]).optional(),
+    termsVersion: z.number().int().min(1),
+    privacyVersion: z.number().int().min(1),
+    termsAcceptedAt: z.string().datetime(),
+    privacyAcceptedAt: z.string().datetime(),
+    newPassword: z.string().optional(),
+  })
+  .superRefine((data, ctx) => {
+    if (
+      data.accountStatus !== AccountStatus.ACTIVE &&
+      (!data.moderationReason || data.moderationReason.trim().length < 3)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Motivo da moderação obrigatório (mín. 3 caracteres) para conta suspensa ou banida.",
+        path: ["moderationReason"],
+      });
+    }
+  });
+
+adminRouter.patch("/users/:id", async (req: Request, res: Response) => {
+  const idParsed = z.string().cuid().safeParse(req.params.id);
+  if (!idParsed.success) {
+    res.status(400).json({ error: "ID inválido" });
+    return;
+  }
+  const targetId = idParsed.data;
+  const actorId = req.auth!.userId;
+
+  const parsed = patchUserBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Dados inválidos", details: parsed.error.flatten() });
+    return;
+  }
+
+  const body = parsed.data;
+  const newPasswordTrim = body.newPassword?.trim() ?? "";
+  if (newPasswordTrim.length > 0 && newPasswordTrim.length < 8) {
+    res.status(400).json({ error: "Senha nova: mínimo 8 caracteres (ou deixe em branco)." });
+    return;
+  }
+
+  if (
+    targetId === actorId &&
+    (body.accountStatus === AccountStatus.BLOCKED || body.accountStatus === AccountStatus.BANNED)
+  ) {
+    res.status(400).json({
+      error: "Não é possível suspender ou banir a própria conta.",
+      code: "SELF_FORBIDDEN",
+    });
+    return;
+  }
+
+  let phoneNormalized: string;
+  try {
+    phoneNormalized = normalizeBrazilPhone(body.phone);
+  } catch (e) {
+    const message = e instanceof Error ? e.message : "Telefone inválido";
+    res.status(400).json({ error: message });
+    return;
+  }
+
+  const emailNormalized = body.email.toLowerCase();
+  const birthDate = new Date(`${body.birthDate}T12:00:00.000Z`);
+
+  try {
+    const existing = await prisma.user.findUnique({ where: { id: targetId } });
+    if (!existing) {
+      res.status(404).json({ error: "Usuário não encontrado" });
+      return;
+    }
+
+    if (existing.role === UserRole.ADMIN && body.role === UserRole.ATHLETE) {
+      const admins = await prisma.user.count({ where: { role: UserRole.ADMIN } });
+      if (admins <= 1) {
+        res.status(400).json({
+          error: "Não é possível rebaixar o único administrador da plataforma.",
+          code: "LAST_ADMIN",
+        });
+        return;
+      }
+    }
+
+    const moderationReason =
+      body.accountStatus === AccountStatus.ACTIVE
+        ? null
+        : body.moderationReason!.trim();
+
+    let moderatedAt: Date | null = null;
+    if (body.accountStatus !== AccountStatus.ACTIVE) {
+      moderatedAt =
+        body.moderatedAt != null ? new Date(body.moderatedAt) : new Date();
+      if (Number.isNaN(moderatedAt.getTime())) {
+        res.status(400).json({ error: "Data de moderação inválida." });
+        return;
+      }
+    }
+
+    const termsAcceptedAt = new Date(body.termsAcceptedAt);
+    const privacyAcceptedAt = new Date(body.privacyAcceptedAt);
+    if (Number.isNaN(termsAcceptedAt.getTime()) || Number.isNaN(privacyAcceptedAt.getTime())) {
+      res.status(400).json({ error: "Datas de aceite dos termos inválidas." });
+      return;
+    }
+
+    const passwordUpdate: { passwordHash: string } | object =
+      newPasswordTrim.length > 0 ? { passwordHash: await bcrypt.hash(newPasswordTrim, 12) } : {};
+
+    const updated = await prisma.user.update({
+      where: { id: targetId },
+      data: {
+        email: emailNormalized,
+        phone: phoneNormalized,
+        fullName: body.fullName.trim(),
+        birthDate,
+        role: body.role,
+        accountStatus: body.accountStatus,
+        moderationReason,
+        moderatedAt,
+        termsVersion: body.termsVersion,
+        privacyVersion: body.privacyVersion,
+        termsAcceptedAt,
+        privacyAcceptedAt,
+        ...passwordUpdate,
+      },
+      select: {
+        id: true,
+        email: true,
+        phone: true,
+        fullName: true,
+        birthDate: true,
+        role: true,
+        accountStatus: true,
+        moderationReason: true,
+        moderatedAt: true,
+        termsVersion: true,
+        privacyVersion: true,
+        termsAcceptedAt: true,
+        privacyAcceptedAt: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+
+    res.json({ user: updated });
+  } catch (err: unknown) {
+    if (
+      err &&
+      typeof err === "object" &&
+      "code" in err &&
+      (err as { code: string }).code === "P2002"
+    ) {
+      res.status(409).json({
+        error: "E-mail ou telefone já está em uso por outra conta.",
+        code: "UNIQUE_VIOLATION",
+      });
+      return;
+    }
+    if (
+      err &&
+      typeof err === "object" &&
+      "code" in err &&
+      (err as { code: string }).code === "P2025"
+    ) {
+      res.status(404).json({ error: "Usuário não encontrado" });
+      return;
+    }
+    const message = err instanceof Error ? err.message : "Erro ao atualizar usuário";
+    res.status(500).json({ error: message });
+  }
+});
 
 adminRouter.patch("/users/:id/account-status", async (req: Request, res: Response) => {
   const idParsed = z.string().cuid().safeParse(req.params.id);
