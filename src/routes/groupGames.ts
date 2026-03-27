@@ -668,7 +668,20 @@ groupGamesRouter.put("/:gameId/team-assignments", async (req: Request, res: Resp
           where: { gameId, userId: a.userId },
           data: { teamSide: a.teamSide },
         });
-        updated += r.count;
+        if (r.count > 0) {
+          updated += r.count;
+          continue;
+        }
+        if (a.teamSide === null) continue;
+        await tx.gameAttendance.create({
+          data: {
+            gameId,
+            userId: a.userId,
+            status: AttendanceStatus.GOING,
+            teamSide: a.teamSide,
+          },
+        });
+        updated += 1;
       }
     });
     res.json({ ok: true, assignmentsUpdated: updated });
