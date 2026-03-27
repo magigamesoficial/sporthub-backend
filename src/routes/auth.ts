@@ -1,8 +1,12 @@
-import { AccountStatus, Prisma, UserRole } from "@prisma/client";
+import { AccountStatus, AttendanceStatus, Prisma, UserRole } from "@prisma/client";
 import bcrypt from "bcryptjs";
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import { requireAuth } from "../middleware/auth";
+import {
+  computeGroupRankingSnapshot,
+  sortRankingRowsByStanding,
+} from "../lib/groupRankingCompute";
 import { normalizeBrazilPhone } from "../lib/phone";
 import { prisma } from "../lib/prisma";
 import {
@@ -319,21 +323,45 @@ authRouter.post("/admin-login", authLoginLimiter, async (req: Request, res: Resp
   }
 });
 
+const meSelect = {
+  id: true,
+  fullName: true,
+  email: true,
+  phone: true,
+  role: true,
+  birthDate: true,
+  createdAt: true,
+  termsVersion: true,
+  privacyVersion: true,
+} as const;
+
+const patchMeSchema = z
+  .object({
+    fullName: z.string().trim().min(2, "Nome muito curto").optional(),
+    email: z.string().trim().email("E-mail inválido").optional(),
+    birthDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use a data no formato AAAA-MM-DD").optional(),
+    currentPassword: z.string().optional(),
+    newPassword: z.union([z.string().min(8, "Nova senha: mínimo 8 caracteres"), z.literal("")]).optional(),
+  })
+  .superRefine((data, ctx) => {
+    const np = data.newPassword?.trim() ?? "";
+    if (np.length > 0) {
+      const cur = data.currentPassword?.trim() ?? "";
+      if (cur.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Informe a senha atual para definir uma nova senha.",
+          path: ["currentPassword"],
+        });
+      }
+    }
+  });
+
 authRouter.get("/me", requireAuth, async (req: Request, res: Response) => {
   try {
     const user = await prisma.user.findUnique({
       where: { id: req.auth!.userId },
-      select: {
-        id: true,
-        fullName: true,
-        email: true,
-        phone: true,
-        role: true,
-        birthDate: true,
-        createdAt: true,
-        termsVersion: true,
-        privacyVersion: true,
-      },
+      select: meSelect,
     });
 
     if (!user) {
@@ -347,6 +375,180 @@ authRouter.get("/me", requireAuth, async (req: Request, res: Response) => {
     res.json({ user });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Erro ao carregar perfil";
+    res.status(500).json({ error: message });
+  }
+});
+
+authRouter.patch("/me", requireAuth, async (req: Request, res: Response) => {
+  if (req.auth!.role !== UserRole.ATHLETE) {
+    res.status(403).json({
+      error: "Alteração de perfil de atleta não se aplica a administradores.",
+      code: "ADMIN_FORBIDDEN",
+    });
+    return;
+  }
+
+  const parsed = patchMeSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Dados inválidos", details: parsed.error.flatten() });
+    return;
+  }
+
+  const body = parsed.data;
+  const userId = req.auth!.userId;
+  const newPw = body.newPassword?.trim() ?? "";
+
+  const data: Prisma.UserUpdateInput = {};
+  if (body.fullName !== undefined) data.fullName = body.fullName;
+  if (body.birthDate !== undefined) {
+    data.birthDate = new Date(`${body.birthDate}T12:00:00.000Z`);
+  }
+
+  try {
+    const existing = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { email: true, passwordHash: true },
+    });
+    if (!existing) {
+      res.status(401).json({ error: "Conta não encontrada", code: "USER_NOT_FOUND" });
+      return;
+    }
+
+    if (body.email !== undefined) {
+      const emailNorm = body.email.toLowerCase();
+      if (emailNorm !== existing.email) {
+        const taken = await prisma.user.findUnique({ where: { email: emailNorm } });
+        if (taken) {
+          res.status(409).json({
+            error: "Este e-mail já está em uso por outra conta.",
+            code: "EMAIL_TAKEN",
+          });
+          return;
+        }
+      }
+      data.email = emailNorm;
+    }
+
+    if (newPw.length > 0) {
+      const cur = body.currentPassword ?? "";
+      const ok = await bcrypt.compare(cur, existing.passwordHash);
+      if (!ok) {
+        res.status(401).json({
+          error: "Senha atual incorreta.",
+          code: "INVALID_PASSWORD",
+        });
+        return;
+      }
+      data.passwordHash = await bcrypt.hash(newPw, 12);
+    }
+
+    if (Object.keys(data).length === 0) {
+      res.status(400).json({ error: "Nenhum dado para atualizar." });
+      return;
+    }
+
+    const user = await prisma.user.update({
+      where: { id: userId },
+      data,
+      select: meSelect,
+    });
+
+    res.json({ user });
+  } catch (err) {
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+      res.status(409).json({ error: "E-mail já cadastrado.", code: "UNIQUE_VIOLATION" });
+      return;
+    }
+    const message = err instanceof Error ? err.message : "Erro ao atualizar perfil";
+    res.status(500).json({ error: message });
+  }
+});
+
+/** Painel “Início” do atleta: jogos, esporte mais frequente, posição no ranking por grupo. */
+authRouter.get("/me/dashboard", requireAuth, async (req: Request, res: Response) => {
+  if (req.auth!.role !== UserRole.ATHLETE) {
+    res.status(403).json({
+      error: "Este painel é para atletas. Use o painel administrativo.",
+      code: "ADMIN_FORBIDDEN",
+    });
+    return;
+  }
+
+  const userId = req.auth!.userId;
+  const now = new Date();
+
+  try {
+    const gamesPlayed = await prisma.gameAttendance.count({
+      where: {
+        userId,
+        status: AttendanceStatus.GOING,
+        game: { startsAt: { lt: now } },
+      },
+    });
+
+    const attendancesWithSport = await prisma.gameAttendance.findMany({
+      where: {
+        userId,
+        status: AttendanceStatus.GOING,
+        game: { startsAt: { lt: now } },
+      },
+      select: { game: { select: { group: { select: { sport: true } } } } },
+    });
+    const sportCount = new Map<string, number>();
+    for (const a of attendancesWithSport) {
+      const s = a.game.group.sport;
+      sportCount.set(s, (sportCount.get(s) ?? 0) + 1);
+    }
+    const sportEntries = [...sportCount.entries()].sort(
+      (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
+    );
+    const topSport =
+      sportEntries.length > 0
+        ? { sport: sportEntries[0]![0], gamesCount: sportEntries[0]![1] }
+        : null;
+
+    const memberships = await prisma.groupMember.findMany({
+      where: { userId },
+      select: { group: { select: { id: true, name: true, sport: true } } },
+    });
+
+    const groupRankings: {
+      groupId: string;
+      groupName: string;
+      sport: string;
+      rank: number;
+      memberCount: number;
+      points: number;
+    }[] = [];
+
+    for (const { group } of memberships) {
+      const snap = await computeGroupRankingSnapshot(group.id, now);
+      if (!snap) continue;
+      const sorted = sortRankingRowsByStanding(snap.rows);
+      const idx = sorted.findIndex((r) => r.userId === userId);
+      if (idx < 0) continue;
+      const meRow = sorted[idx]!;
+      groupRankings.push({
+        groupId: group.id,
+        groupName: group.name,
+        sport: group.sport,
+        rank: idx + 1,
+        memberCount: sorted.length,
+        points: meRow.points,
+      });
+    }
+    groupRankings.sort((a, b) =>
+      a.groupName.localeCompare(b.groupName, "pt-BR", { sensitivity: "base" }),
+    );
+
+    res.json({
+      gamesPlayed,
+      topSport,
+      groupRankings,
+      groupsCount: memberships.length,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Erro ao montar painel";
     res.status(500).json({ error: message });
   }
 });
