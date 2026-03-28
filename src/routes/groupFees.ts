@@ -21,6 +21,103 @@ const markUserBodySchema = z.object({
   userId: z.string().cuid("ID de usuário inválido"),
 });
 
+/** Visão anual: meses do ano com status de pagamento por membro (para grade na UI). */
+groupFeesRouter.get("/year/:year", async (req: Request, res: Response) => {
+  const year = parseInt(req.params.year, 10);
+  if (!Number.isFinite(year) || year < 2000 || year > 2100) {
+    res.status(400).json({ error: "Ano inválido" });
+    return;
+  }
+  const groupId = req.params.groupId as string;
+  const viewerId = req.auth!.userId;
+  const fromYm = `${year}-01`;
+  const toYm = `${year}-12`;
+
+  try {
+    const self = await prisma.groupMember.findUnique({
+      where: { groupId_userId: { groupId, userId: viewerId } },
+    });
+    if (!self) {
+      res.status(403).json({ error: "Você não participa deste grupo" });
+      return;
+    }
+
+    const [members, feesInYear] = await Promise.all([
+      prisma.groupMember.findMany({
+        where: { groupId },
+        include: {
+          user: { select: { id: true, fullName: true, phone: true } },
+          feePlan: { select: { id: true, name: true, amountCents: true } },
+        },
+        orderBy: [{ role: "asc" }, { joinedAt: "asc" }],
+      }),
+      prisma.memberMonthlyFee.findMany({
+        where: {
+          groupId,
+          periodMonth: { gte: fromYm, lte: toYm },
+        },
+        select: { userId: true, periodMonth: true, paidAt: true },
+      }),
+    ]);
+
+    const paidAtByUserMonth = new Map<string, Map<string, string>>();
+    for (const f of feesInYear) {
+      let inner = paidAtByUserMonth.get(f.userId);
+      if (!inner) {
+        inner = new Map();
+        paidAtByUserMonth.set(f.userId, inner);
+      }
+      inner.set(f.periodMonth, f.paidAt.toISOString());
+    }
+
+    const todayYm = currentYearMonthLocal();
+
+    res.json({
+      year,
+      todayYearMonth: todayYm,
+      viewer: {
+        canManageMonthlyFees: canManageMonthlyFees(self.role),
+      },
+      rows: members.map((m) => {
+        const joinYm = yearMonthFromDate(m.joinedAt);
+        const months: Record<
+          string,
+          { applicable: boolean; paid: boolean; paidAt: string | null }
+        > = {};
+        for (let mo = 1; mo <= 12; mo += 1) {
+          const ym = `${year}-${String(mo).padStart(2, "0")}`;
+          const hasPlan = Boolean(m.feePlanId);
+          const applicable = hasPlan && ym >= joinYm;
+          if (!applicable) {
+            months[ym] = { applicable: false, paid: false, paidAt: null };
+            continue;
+          }
+          const paidAt = paidAtByUserMonth.get(m.user.id)?.get(ym) ?? null;
+          months[ym] = { applicable: true, paid: paidAt != null, paidAt };
+        }
+        return {
+          userId: m.user.id,
+          fullName: m.user.fullName,
+          phone: m.user.phone,
+          role: m.role,
+          feePlan: m.feePlan
+            ? {
+                id: m.feePlan.id,
+                name: m.feePlan.name,
+                amountCents: m.feePlan.amountCents,
+              }
+            : null,
+          joinYm,
+          months,
+        };
+      }),
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Erro ao listar mensalidades do ano";
+    res.status(500).json({ error: message });
+  }
+});
+
 groupFeesRouter.get("/:yearMonth", async (req: Request, res: Response) => {
   const ymParsed = yearMonthParam.safeParse(req.params.yearMonth);
   if (!ymParsed.success) {
