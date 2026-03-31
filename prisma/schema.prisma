@@ -155,6 +155,8 @@ model Group {
   eventMaxParticipants         Int?
   /** Vagas reservadas (ex.: goleiros): reduzem as vagas de auto-confirmação; líderes preenchem. */
   eventReservedSlots           Int     @default(0)
+  /** Posição alvo das vagas reservadas (valor do catálogo por esporte, ex. GOALKEEPER). */
+  eventReservedSlotsPositionKey String? @db.VarChar(40)
 
   createdAt   DateTime        @default(now())
   updatedAt   DateTime        @updatedAt

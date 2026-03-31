@@ -17,7 +17,7 @@ import {
 } from "../lib/groupPermissions";
 import { normalizeBrazilPhone } from "../lib/phone";
 import { prisma } from "../lib/prisma";
-import { isValidPositionKey, positionsForSport } from "../lib/sportPositions";
+import { isValidPositionKey, positionsForSport, positionLabelForSport } from "../lib/sportPositions";
 import { requireAuth } from "../middleware/auth";
 import { groupFeePlansRouter } from "./groupFeePlans";
 import { groupFeesRouter } from "./groupFees";
@@ -432,6 +432,9 @@ const groupSettingsPatchSchema = z.object({
   rsvpDeadlineHoursBeforeStart: z.union([z.number().int().min(0).max(8760), z.null()]).optional(),
   eventMaxParticipants: z.union([z.number().int().min(1).max(500), z.null()]).optional(),
   eventReservedSlots: z.number().int().min(0).max(500).optional(),
+  eventReservedSlotsPositionKey: z
+    .union([z.string().trim().max(40), z.literal(""), z.null()])
+    .optional(),
 });
 
 const memberRolePatchSchema = z.object({
@@ -551,6 +554,7 @@ groupsRouter.get("/:groupId/settings", async (req: Request, res: Response) => {
         rsvpDeadlineHoursBeforeStart: true,
         eventMaxParticipants: true,
         eventReservedSlots: true,
+        eventReservedSlotsPositionKey: true,
       },
     });
     if (!group) {
@@ -565,6 +569,8 @@ groupsRouter.get("/:groupId/settings", async (req: Request, res: Response) => {
       res.status(403).json({ error: "Você não participa deste grupo" });
       return;
     }
+
+    const sportPositionOptions = positionsForSport(group.sport);
 
     const [members, fees, plans] = await Promise.all([
       prisma.groupMember.findMany({
@@ -609,7 +615,16 @@ groupsRouter.get("/:groupId/settings", async (req: Request, res: Response) => {
         rsvpDeadlineHoursBeforeStart: group.rsvpDeadlineHoursBeforeStart,
         eventMaxParticipants: group.eventMaxParticipants,
         eventReservedSlots: group.eventReservedSlots,
+        eventReservedSlotsPositionKey: group.eventReservedSlotsPositionKey ?? null,
+        eventReservedSlotsPositionLabel: positionLabelForSport(
+          group.sport,
+          group.eventReservedSlotsPositionKey,
+        ),
       },
+      sportPositionOptions: sportPositionOptions.map((o) => ({
+        value: o.value,
+        label: o.label,
+      })),
       viewer: {
         canEditSettings: canEditGroupSettings(self.role),
       },
@@ -670,7 +685,12 @@ groupsRouter.patch("/:groupId/settings", async (req: Request, res: Response) => 
 
     const group = await prisma.group.findUnique({
       where: { id: groupId },
-      select: { id: true },
+      select: {
+        id: true,
+        sport: true,
+        eventReservedSlots: true,
+        eventReservedSlotsPositionKey: true,
+      },
     });
     if (!group) {
       res.status(404).json({ error: "Grupo não encontrado" });
@@ -702,6 +722,32 @@ groupsRouter.patch("/:groupId/settings", async (req: Request, res: Response) => 
       data.eventReservedSlots = parsed.data.eventReservedSlots;
     }
 
+    const nextReserved =
+      parsed.data.eventReservedSlots !== undefined
+        ? parsed.data.eventReservedSlots
+        : group.eventReservedSlots;
+    let nextReservedPos: string | null =
+      parsed.data.eventReservedSlotsPositionKey !== undefined
+        ? parsed.data.eventReservedSlotsPositionKey === "" ||
+          parsed.data.eventReservedSlotsPositionKey === null
+          ? null
+          : parsed.data.eventReservedSlotsPositionKey.trim()
+        : group.eventReservedSlotsPositionKey ?? null;
+    if (nextReserved === 0) nextReservedPos = null;
+    if (
+      parsed.data.eventReservedSlotsPositionKey !== undefined ||
+      parsed.data.eventReservedSlots !== undefined
+    ) {
+      if (nextReservedPos && !isValidPositionKey(group.sport, nextReservedPos)) {
+        res.status(400).json({
+          error: "Posição inválida para vagas reservadas neste esporte.",
+          code: "INVALID_RESERVED_POSITION",
+        });
+        return;
+      }
+      data.eventReservedSlotsPositionKey = nextReservedPos;
+    }
+
     const updated = await prisma.group.update({
       where: { id: groupId },
       data,
@@ -713,17 +759,37 @@ groupsRouter.patch("/:groupId/settings", async (req: Request, res: Response) => 
         rsvpDeadlineHoursBeforeStart: true,
         eventMaxParticipants: true,
         eventReservedSlots: true,
+        eventReservedSlotsPositionKey: true,
       },
     });
 
     const maxP = updated.eventMaxParticipants;
-    const resS = updated.eventReservedSlots;
+    let resS = updated.eventReservedSlots;
     if (maxP != null && resS > maxP) {
       await prisma.group.update({
         where: { id: groupId },
         data: { eventReservedSlots: maxP },
       });
+      resS = maxP;
       updated.eventReservedSlots = maxP;
+    }
+    if (resS === 0 && updated.eventReservedSlotsPositionKey != null) {
+      const cleared = await prisma.group.update({
+        where: { id: groupId },
+        data: { eventReservedSlotsPositionKey: null },
+        select: {
+          statuteUrl: true,
+          localRulesNote: true,
+          richPublicProfile: true,
+          rsvpAllowMaybe: true,
+          rsvpDeadlineHoursBeforeStart: true,
+          eventMaxParticipants: true,
+          eventReservedSlots: true,
+          eventReservedSlotsPositionKey: true,
+        },
+      });
+      res.json({ group: cleared });
+      return;
     }
 
     res.json({ group: updated });

@@ -34,4 +34,5 @@ export type GroupEventRsvpFields = Pick<
   | "rsvpDeadlineHoursBeforeStart"
   | "eventMaxParticipants"
   | "eventReservedSlots"
+  | "eventReservedSlotsPositionKey"
 >;
