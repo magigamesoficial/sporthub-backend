@@ -1,5 +1,6 @@
 import {
   AttendanceStatus,
+  GameKind,
   GameOutcome,
   GameTeamSide,
   GroupMemberRole,
@@ -7,6 +8,11 @@ import {
 } from "@prisma/client";
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
+import {
+  computeAutoGoingCap,
+  isPastRsvpDeadline,
+  eventSettingsDeadlineAt,
+} from "../lib/eventRsvp";
 import { RESULT_AND_SCOUT_UNLOCK_MS, resultAndScoutUnlocked } from "../lib/gameUnlock";
 import { canAssignGameTeams, canManageGroupGames } from "../lib/groupPermissions";
 import { prisma } from "../lib/prisma";
@@ -16,6 +22,7 @@ export const groupGamesRouter = Router({ mergeParams: true });
 const cuidParam = z.string().cuid("ID inválido");
 
 const createGameSchema = z.object({
+  kind: z.nativeEnum(GameKind).optional(),
   title: z.string().trim().min(1, "Título obrigatório").max(120).optional(),
   location: z.union([z.string().trim().max(200), z.literal("")]).optional(),
   startsAt: z
@@ -24,7 +31,15 @@ const createGameSchema = z.object({
     .refine((s) => !Number.isNaN(new Date(s).getTime()), "Data/hora inválida (ISO 8601)"),
 });
 
-const attendanceBodySchema = z.object({
+const selfAttendanceBodySchema = z.object({
+  status: z.union([
+    z.literal(AttendanceStatus.GOING),
+    z.literal(AttendanceStatus.NOT_GOING),
+    z.literal(AttendanceStatus.MAYBE),
+  ]),
+});
+
+const moderatorAttendanceBodySchema = z.object({
   status: z.nativeEnum(AttendanceStatus),
 });
 
@@ -70,6 +85,56 @@ async function requireGroupMember(
     where: { groupId_userId: { groupId, userId } },
   });
   return m;
+}
+
+async function countVoluntaryGoing(
+  tx: Prisma.TransactionClient,
+  gameId: string,
+): Promise<number> {
+  return tx.gameAttendance.count({
+    where: {
+      gameId,
+      status: AttendanceStatus.GOING,
+      forcedByModerator: false,
+    },
+  });
+}
+
+async function promoteWaitlistForGame(
+  tx: Prisma.TransactionClient,
+  gameId: string,
+  group: { eventMaxParticipants: number | null; eventReservedSlots: number },
+): Promise<void> {
+  const autoCap = computeAutoGoingCap(group.eventMaxParticipants, group.eventReservedSlots);
+  if (!Number.isFinite(autoCap)) {
+    await tx.gameAttendance.updateMany({
+      where: { gameId, status: AttendanceStatus.WAITLIST },
+      data: {
+        status: AttendanceStatus.GOING,
+        waitlistEnteredAt: null,
+        forcedByModerator: false,
+        teamSide: null,
+      },
+    });
+    return;
+  }
+  for (;;) {
+    const vol = await countVoluntaryGoing(tx, gameId);
+    if (vol >= autoCap) break;
+    const next = await tx.gameAttendance.findFirst({
+      where: { gameId, status: AttendanceStatus.WAITLIST },
+      orderBy: [{ waitlistEnteredAt: "asc" }, { updatedAt: "asc" }],
+    });
+    if (!next) break;
+    await tx.gameAttendance.update({
+      where: { id: next.id },
+      data: {
+        status: AttendanceStatus.GOING,
+        waitlistEnteredAt: null,
+        forcedByModerator: false,
+      },
+    });
+  }
 }
 
 async function enabledScoutMetricIds(groupId: string): Promise<string[]> {
@@ -125,9 +190,12 @@ groupGamesRouter.get("/", async (req: Request, res: Response) => {
             _count: { _all: true },
           });
 
-    const countMap = new Map<string, { GOING: number; MAYBE: number; NOT_GOING: number }>();
+    const countMap = new Map<
+      string,
+      { GOING: number; MAYBE: number; NOT_GOING: number; WAITLIST: number }
+    >();
     for (const g of games) {
-      countMap.set(g.id, { GOING: 0, MAYBE: 0, NOT_GOING: 0 });
+      countMap.set(g.id, { GOING: 0, MAYBE: 0, NOT_GOING: 0, WAITLIST: 0 });
     }
     for (const row of aggregates) {
       const cur = countMap.get(row.gameId);
@@ -135,6 +203,7 @@ groupGamesRouter.get("/", async (req: Request, res: Response) => {
       if (row.status === AttendanceStatus.GOING) cur.GOING += row._count._all;
       if (row.status === AttendanceStatus.MAYBE) cur.MAYBE += row._count._all;
       if (row.status === AttendanceStatus.NOT_GOING) cur.NOT_GOING += row._count._all;
+      if (row.status === AttendanceStatus.WAITLIST) cur.WAITLIST += row._count._all;
     }
 
     res.json({
@@ -154,7 +223,13 @@ groupGamesRouter.get("/", async (req: Request, res: Response) => {
         createdBy: g.createdBy
           ? { id: g.createdBy.id, fullName: g.createdBy.fullName }
           : null,
-        counts: countMap.get(g.id) ?? { GOING: 0, MAYBE: 0, NOT_GOING: 0 },
+        kind: g.kind,
+        counts: countMap.get(g.id) ?? {
+          GOING: 0,
+          MAYBE: 0,
+          NOT_GOING: 0,
+          WAITLIST: 0,
+        },
       })),
     });
   } catch (err) {
@@ -199,6 +274,7 @@ groupGamesRouter.post("/", async (req: Request, res: Response) => {
     const game = await prisma.groupGame.create({
       data: {
         groupId,
+        kind: parsed.data.kind ?? GameKind.MATCH,
         title: parsed.data.title?.trim() || "Jogo",
         location,
         startsAt,
@@ -209,6 +285,7 @@ groupGamesRouter.post("/", async (req: Request, res: Response) => {
     res.status(201).json({
       game: {
         id: game.id,
+        kind: game.kind,
         title: game.title,
         location: game.location,
         startsAt: game.startsAt.toISOString(),
@@ -243,6 +320,15 @@ groupGamesRouter.get("/:gameId", async (req: Request, res: Response) => {
       where: { id: gameId, groupId },
       include: {
         createdBy: { select: { id: true, fullName: true } },
+        group: {
+          select: {
+            rsvpAllowMaybe: true,
+            rsvpDeadlineHoursBeforeStart: true,
+            eventMaxParticipants: true,
+            eventReservedSlots: true,
+            sport: true,
+          },
+        },
       },
     });
     if (!game) {
@@ -250,7 +336,9 @@ groupGamesRouter.get("/:gameId", async (req: Request, res: Response) => {
       return;
     }
 
-    const [members, attendances, enabledIds, statRows, groupSport] = await Promise.all([
+    const groupSport = game.group.sport;
+
+    const [members, attendances, enabledIds, statRows] = await Promise.all([
       prisma.groupMember.findMany({
         where: { groupId },
         include: { user: { select: { id: true, fullName: true, phone: true } } },
@@ -263,19 +351,15 @@ groupGamesRouter.get("/:gameId", async (req: Request, res: Response) => {
       prisma.gameScoutStat.findMany({
         where: { gameId },
       }),
-      prisma.group.findUnique({
-        where: { id: groupId },
-        select: { sport: true },
-      }),
     ]);
 
     const statMetricIds = [...new Set(statRows.map((s) => s.scoutMetricDefinitionId))];
     const defIdsForUi = [...new Set([...enabledIds, ...statMetricIds])];
 
     const metricDefs =
-      groupSport && defIdsForUi.length > 0
+      defIdsForUi.length > 0
         ? await prisma.scoutMetricDefinition.findMany({
-            where: { sport: groupSport.sport, id: { in: defIdsForUi } },
+            where: { sport: groupSport, id: { in: defIdsForUi } },
             orderBy: [{ sortOrder: "asc" }, { label: "asc" }],
           })
         : [];
@@ -292,10 +376,21 @@ groupGamesRouter.get("/:gameId", async (req: Request, res: Response) => {
     }
 
     const unlocked = resultAndScoutUnlocked(game.startsAt);
+    const gset = game.group;
+    const autoCap = computeAutoGoingCap(gset.eventMaxParticipants, gset.eventReservedSlots);
 
     res.json({
+      eventSettings: {
+        rsvpAllowMaybe: gset.rsvpAllowMaybe,
+        rsvpDeadlineHoursBeforeStart: gset.rsvpDeadlineHoursBeforeStart,
+        eventMaxParticipants: gset.eventMaxParticipants,
+        eventReservedSlots: gset.eventReservedSlots,
+        deadlineAt: eventSettingsDeadlineAt(game.startsAt, gset.rsvpDeadlineHoursBeforeStart),
+        autoGoingCap: Number.isFinite(autoCap) ? autoCap : null,
+      },
       game: {
         id: game.id,
+        kind: game.kind,
         title: game.title,
         location: game.location,
         startsAt: game.startsAt.toISOString(),
@@ -315,6 +410,7 @@ groupGamesRouter.get("/:gameId", async (req: Request, res: Response) => {
         userId,
         canManageGames: canManageGroupGames(member.role),
         canAssignTeams: canAssignGameTeams(member.role),
+        canModerateAttendance: canManageGroupGames(member.role),
         myStatus: attByUser.get(userId)?.status ?? null,
       },
       scout: {
@@ -338,6 +434,8 @@ groupGamesRouter.get("/:gameId", async (req: Request, res: Response) => {
                 status: a.status,
                 teamSide: a.teamSide,
                 updatedAt: a.updatedAt.toISOString(),
+                waitlistEnteredAt: a.waitlistEnteredAt?.toISOString() ?? null,
+                forcedByModerator: a.forcedByModerator,
               }
             : null,
           scoutValues: statsByUser.get(m.userId) ?? [],
@@ -361,7 +459,7 @@ groupGamesRouter.post("/:gameId/attendance", async (req: Request, res: Response)
   const gameId = gameIdParsed.data;
   const userId = req.auth!.userId;
 
-  const parsed = attendanceBodySchema.safeParse(req.body);
+  const parsed = selfAttendanceBodySchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: "Dados inválidos", details: parsed.error.flatten() });
     return;
@@ -374,31 +472,116 @@ groupGamesRouter.post("/:gameId/attendance", async (req: Request, res: Response)
   }
 
   try {
-    const game = await prisma.groupGame.findFirst({
+    const gameRow = await prisma.groupGame.findFirst({
       where: { id: gameId, groupId },
-      select: { id: true },
+      select: { id: true, startsAt: true },
     });
-    if (!game) {
+    if (!gameRow) {
       res.status(404).json({ error: "Jogo não encontrado" });
       return;
     }
 
-    const row = await prisma.gameAttendance.upsert({
-      where: { gameId_userId: { gameId, userId } },
-      create: {
-        gameId,
-        userId,
-        status: parsed.data.status,
+    const groupRow = await prisma.group.findUnique({
+      where: { id: groupId },
+      select: {
+        rsvpAllowMaybe: true,
+        rsvpDeadlineHoursBeforeStart: true,
+        eventMaxParticipants: true,
+        eventReservedSlots: true,
       },
-      update: {
-        status: parsed.data.status,
-      },
+    });
+    if (!groupRow) {
+      res.status(404).json({ error: "Grupo não encontrado" });
+      return;
+    }
+
+    if (parsed.data.status === AttendanceStatus.MAYBE && !groupRow.rsvpAllowMaybe) {
+      res.status(400).json({
+        error: "Este grupo não permite resposta «Talvez».",
+        code: "MAYBE_DISABLED",
+      });
+      return;
+    }
+
+    const now = new Date();
+    const deadlinePassed = isPastRsvpDeadline(
+      now,
+      gameRow.startsAt,
+      groupRow.rsvpDeadlineHoursBeforeStart,
+    );
+    const autoCap = computeAutoGoingCap(
+      groupRow.eventMaxParticipants,
+      groupRow.eventReservedSlots,
+    );
+
+    const row = await prisma.$transaction(async (tx) => {
+      let nextStatus: AttendanceStatus = parsed.data.status;
+      let waitAt: Date | null = null;
+      let forced = false;
+
+      if (parsed.data.status === AttendanceStatus.GOING) {
+        const selfRow = await tx.gameAttendance.findUnique({
+          where: { gameId_userId: { gameId, userId } },
+          select: { status: true, forcedByModerator: true },
+        });
+        const vol = await countVoluntaryGoing(tx, gameId);
+        const selfVoluntary =
+          selfRow?.status === AttendanceStatus.GOING && !selfRow.forcedByModerator;
+        const volExcl = selfVoluntary ? vol - 1 : vol;
+
+        if (deadlinePassed || (Number.isFinite(autoCap) && volExcl >= autoCap)) {
+          nextStatus = AttendanceStatus.WAITLIST;
+          waitAt = now;
+          forced = false;
+        } else {
+          nextStatus = AttendanceStatus.GOING;
+          waitAt = null;
+          forced = false;
+        }
+      } else {
+        waitAt = null;
+        forced = false;
+      }
+
+      const createData: Prisma.GameAttendanceCreateInput = {
+        game: { connect: { id: gameId } },
+        user: { connect: { id: userId } },
+        status: nextStatus,
+        waitlistEnteredAt: waitAt,
+        forcedByModerator: forced,
+        teamSide: null,
+      };
+
+      const updateData: Prisma.GameAttendanceUpdateInput = {
+        status: nextStatus,
+        waitlistEnteredAt: waitAt,
+        forcedByModerator: forced,
+      };
+
+      if (
+        nextStatus === AttendanceStatus.NOT_GOING ||
+        nextStatus === AttendanceStatus.MAYBE ||
+        nextStatus === AttendanceStatus.WAITLIST
+      ) {
+        updateData.teamSide = null;
+      }
+
+      const saved = await tx.gameAttendance.upsert({
+        where: { gameId_userId: { gameId, userId } },
+        create: createData,
+        update: updateData,
+      });
+
+      await promoteWaitlistForGame(tx, gameId, groupRow);
+      return saved;
     });
 
     res.json({
       attendance: {
         status: row.status,
         updatedAt: row.updatedAt.toISOString(),
+        waitlistEnteredAt: row.waitlistEnteredAt?.toISOString() ?? null,
+        forcedByModerator: row.forcedByModerator,
       },
     });
   } catch (err) {
@@ -406,6 +589,131 @@ groupGamesRouter.post("/:gameId/attendance", async (req: Request, res: Response)
       res.status(409).json({ error: "Conflito ao salvar presença. Tente novamente." });
       return;
     }
+    const message = err instanceof Error ? err.message : "Erro ao salvar presença";
+    res.status(500).json({ error: message });
+  }
+});
+
+groupGamesRouter.put("/:gameId/members/:targetUserId/attendance", async (req: Request, res: Response) => {
+  const groupIdParsed = cuidParam.safeParse(req.params.groupId);
+  const gameIdParsed = cuidParam.safeParse(req.params.gameId);
+  const targetParsed = cuidParam.safeParse(req.params.targetUserId);
+  if (!groupIdParsed.success || !gameIdParsed.success || !targetParsed.success) {
+    res.status(400).json({ error: "Parâmetros inválidos" });
+    return;
+  }
+  const groupId = groupIdParsed.data;
+  const gameId = gameIdParsed.data;
+  const targetUserId = targetParsed.data;
+  const actorId = req.auth!.userId;
+
+  const parsed = moderatorAttendanceBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Dados inválidos", details: parsed.error.flatten() });
+    return;
+  }
+
+  const actor = await requireGroupMember(groupId, actorId);
+  if (!actor || !canManageGroupGames(actor.role)) {
+    res.status(403).json({
+      error: "Apenas presidente, vice, tesoureiro ou moderador podem ajustar presenças.",
+      code: "ATT_MODERATE_FORBIDDEN",
+    });
+    return;
+  }
+
+  const targetMember = await prisma.groupMember.findUnique({
+    where: { groupId_userId: { groupId, userId: targetUserId } },
+  });
+  if (!targetMember) {
+    res.status(404).json({ error: "Atleta não participa deste grupo." });
+    return;
+  }
+
+  try {
+    const gameRow = await prisma.groupGame.findFirst({
+      where: { id: gameId, groupId },
+      select: { id: true, startsAt: true },
+    });
+    if (!gameRow) {
+      res.status(404).json({ error: "Jogo não encontrado" });
+      return;
+    }
+
+    const groupRow = await prisma.group.findUnique({
+      where: { id: groupId },
+      select: {
+        rsvpAllowMaybe: true,
+        eventMaxParticipants: true,
+        eventReservedSlots: true,
+      },
+    });
+    if (!groupRow) {
+      res.status(404).json({ error: "Grupo não encontrado" });
+      return;
+    }
+
+    if (parsed.data.status === AttendanceStatus.MAYBE && !groupRow.rsvpAllowMaybe) {
+      res.status(400).json({
+        error: "Este grupo não permite resposta «Talvez».",
+        code: "MAYBE_DISABLED",
+      });
+      return;
+    }
+
+    const now = new Date();
+    const row = await prisma.$transaction(async (tx) => {
+      const st = parsed.data.status;
+      let waitAt: Date | null = null;
+      let forced = false;
+
+      if (st === AttendanceStatus.GOING) {
+        forced = true;
+        waitAt = null;
+      } else if (st === AttendanceStatus.WAITLIST) {
+        forced = false;
+        waitAt = now;
+      } else {
+        forced = false;
+        waitAt = null;
+      }
+
+      const updatePayload: Prisma.GameAttendanceUpdateInput = {
+        status: st,
+        waitlistEnteredAt: waitAt,
+        forcedByModerator: forced,
+      };
+      if (st !== AttendanceStatus.GOING) {
+        updatePayload.teamSide = null;
+      }
+
+      const saved = await tx.gameAttendance.upsert({
+        where: { gameId_userId: { gameId, userId: targetUserId } },
+        create: {
+          game: { connect: { id: gameId } },
+          user: { connect: { id: targetUserId } },
+          status: st,
+          waitlistEnteredAt: waitAt,
+          forcedByModerator: forced,
+          teamSide: null,
+        },
+        update: updatePayload,
+      });
+
+      await promoteWaitlistForGame(tx, gameId, groupRow);
+      return saved;
+    });
+
+    res.json({
+      attendance: {
+        userId: targetUserId,
+        status: row.status,
+        updatedAt: row.updatedAt.toISOString(),
+        waitlistEnteredAt: row.waitlistEnteredAt?.toISOString() ?? null,
+        forcedByModerator: row.forcedByModerator,
+      },
+    });
+  } catch (err) {
     const message = err instanceof Error ? err.message : "Erro ao salvar presença";
     res.status(500).json({ error: message });
   }
@@ -657,6 +965,15 @@ groupGamesRouter.put("/:gameId/team-assignments", async (req: Request, res: Resp
     ),
   );
 
+  const groupRow = await prisma.group.findUnique({
+    where: { id: groupId },
+    select: { eventMaxParticipants: true, eventReservedSlots: true },
+  });
+  if (!groupRow) {
+    res.status(404).json({ error: "Grupo não encontrado" });
+    return;
+  }
+
   try {
     let updated = 0;
     await prisma.$transaction(async (tx) => {
@@ -664,25 +981,40 @@ groupGamesRouter.put("/:gameId/team-assignments", async (req: Request, res: Resp
         if (!memberIds.has(a.userId)) {
           throw new Error(`NOT_MEMBER:${a.userId}`);
         }
+        if (a.teamSide === null) {
+          const r = await tx.gameAttendance.updateMany({
+            where: { gameId, userId: a.userId },
+            data: { teamSide: null },
+          });
+          updated += r.count;
+          continue;
+        }
         const r = await tx.gameAttendance.updateMany({
           where: { gameId, userId: a.userId },
-          data: { teamSide: a.teamSide },
+          data: {
+            teamSide: a.teamSide,
+            status: AttendanceStatus.GOING,
+            forcedByModerator: true,
+            waitlistEnteredAt: null,
+          },
         });
         if (r.count > 0) {
           updated += r.count;
           continue;
         }
-        if (a.teamSide === null) continue;
         await tx.gameAttendance.create({
           data: {
             gameId,
             userId: a.userId,
             status: AttendanceStatus.GOING,
             teamSide: a.teamSide,
+            forcedByModerator: true,
+            waitlistEnteredAt: null,
           },
         });
         updated += 1;
       }
+      await promoteWaitlistForGame(tx, gameId, groupRow);
     });
     res.json({ ok: true, assignmentsUpdated: updated });
   } catch (err) {

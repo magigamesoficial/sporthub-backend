@@ -424,6 +424,10 @@ const groupSettingsPatchSchema = z.object({
   statuteUrl: z.union([z.string().url().max(2000), z.literal(""), z.null()]).optional(),
   localRulesNote: z.union([z.string().max(20_000), z.literal(""), z.null()]).optional(),
   richPublicProfile: z.boolean().optional(),
+  rsvpAllowMaybe: z.boolean().optional(),
+  rsvpDeadlineHoursBeforeStart: z.union([z.number().int().min(0).max(8760), z.null()]).optional(),
+  eventMaxParticipants: z.union([z.number().int().min(1).max(500), z.null()]).optional(),
+  eventReservedSlots: z.number().int().min(0).max(500).optional(),
 });
 
 const memberRolePatchSchema = z.object({
@@ -529,6 +533,10 @@ groupsRouter.get("/:groupId/settings", async (req: Request, res: Response) => {
         localRulesNote: true,
         richPublicProfile: true,
         presidentId: true,
+        rsvpAllowMaybe: true,
+        rsvpDeadlineHoursBeforeStart: true,
+        eventMaxParticipants: true,
+        eventReservedSlots: true,
       },
     });
     if (!group) {
@@ -583,6 +591,10 @@ groupsRouter.get("/:groupId/settings", async (req: Request, res: Response) => {
         localRulesNote: group.localRulesNote,
         richPublicProfile: group.richPublicProfile,
         presidentId: group.presidentId,
+        rsvpAllowMaybe: group.rsvpAllowMaybe,
+        rsvpDeadlineHoursBeforeStart: group.rsvpDeadlineHoursBeforeStart,
+        eventMaxParticipants: group.eventMaxParticipants,
+        eventReservedSlots: group.eventReservedSlots,
       },
       viewer: {
         canEditSettings: canEditGroupSettings(self.role),
@@ -663,6 +675,18 @@ groupsRouter.patch("/:groupId/settings", async (req: Request, res: Response) => 
     if (parsed.data.richPublicProfile !== undefined) {
       data.richPublicProfile = parsed.data.richPublicProfile;
     }
+    if (parsed.data.rsvpAllowMaybe !== undefined) {
+      data.rsvpAllowMaybe = parsed.data.rsvpAllowMaybe;
+    }
+    if (parsed.data.rsvpDeadlineHoursBeforeStart !== undefined) {
+      data.rsvpDeadlineHoursBeforeStart = parsed.data.rsvpDeadlineHoursBeforeStart;
+    }
+    if (parsed.data.eventMaxParticipants !== undefined) {
+      data.eventMaxParticipants = parsed.data.eventMaxParticipants;
+    }
+    if (parsed.data.eventReservedSlots !== undefined) {
+      data.eventReservedSlots = parsed.data.eventReservedSlots;
+    }
 
     const updated = await prisma.group.update({
       where: { id: groupId },
@@ -671,8 +695,22 @@ groupsRouter.patch("/:groupId/settings", async (req: Request, res: Response) => 
         statuteUrl: true,
         localRulesNote: true,
         richPublicProfile: true,
+        rsvpAllowMaybe: true,
+        rsvpDeadlineHoursBeforeStart: true,
+        eventMaxParticipants: true,
+        eventReservedSlots: true,
       },
     });
+
+    const maxP = updated.eventMaxParticipants;
+    const resS = updated.eventReservedSlots;
+    if (maxP != null && resS > maxP) {
+      await prisma.group.update({
+        where: { id: groupId },
+        data: { eventReservedSlots: maxP },
+      });
+      updated.eventReservedSlots = maxP;
+    }
 
     res.json({ group: updated });
   } catch (err) {

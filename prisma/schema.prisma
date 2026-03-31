@@ -51,6 +51,14 @@ enum AttendanceStatus {
   GOING
   NOT_GOING
   MAYBE
+  /** Confirmação em fila (limite de vagas ou prazo de RSVP). */
+  WAITLIST
+}
+
+/** Jogo esportivo (times, placar) ou evento social (churrasco, compra de materiais, etc.). */
+enum GameKind {
+  MATCH
+  SOCIAL
 }
 
 enum LedgerEntryKind {
@@ -132,6 +140,15 @@ model Group {
   localRulesNote    String? @db.Text
   /** Se verdadeiro e o grupo for público, a página «ver perfil» exibe planos, situação de mensalidade etc. */
   richPublicProfile Boolean @default(false)
+  /** Permite opção «Talvez» na confirmação de presença em eventos. */
+  rsvpAllowMaybe               Boolean @default(true)
+  /** Horas antes do início do evento: depois desse instante, «Sim» do próprio membro entra na fila (se houver política de fila). Null = só limite de vagas. */
+  rsvpDeadlineHoursBeforeStart Int?
+  /** Máximo de confirmados «Sim»; null = sem teto para auto-confirmação. */
+  eventMaxParticipants         Int?
+  /** Vagas reservadas (ex.: goleiros): reduzem as vagas de auto-confirmação; líderes preenchem. */
+  eventReservedSlots           Int     @default(0)
+
   createdAt   DateTime        @default(now())
   updatedAt   DateTime        @updatedAt
 
@@ -216,6 +233,7 @@ model GroupGame {
   id              String        @id @default(cuid())
   groupId         String
   group           Group         @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  kind            GameKind      @default(MATCH)
   title           String        @default("Jogo")
   location        String?
   startsAt        DateTime
@@ -241,9 +259,14 @@ model GameAttendance {
   user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
   status    AttendanceStatus
   teamSide  GameTeamSide?
+  /** Quando entrou na fila de espera (ordenar por FIFO). */
+  waitlistEnteredAt   DateTime?
+  /** Confirmado por líder, pode exceder vagas normais ou reservas. */
+  forcedByModerator   Boolean           @default(false)
   updatedAt DateTime         @updatedAt
 
   @@unique([gameId, userId])
+  @@index([gameId, status])
   @@map("game_attendances")
 }
 
