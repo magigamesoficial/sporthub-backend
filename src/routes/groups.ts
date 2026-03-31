@@ -1,4 +1,5 @@
 import {
+  DominantSide,
   GroupMemberRole,
   GroupVisibility,
   JoinRequestStatus,
@@ -16,6 +17,7 @@ import {
 } from "../lib/groupPermissions";
 import { normalizeBrazilPhone } from "../lib/phone";
 import { prisma } from "../lib/prisma";
+import { isValidPositionKey, positionsForSport } from "../lib/sportPositions";
 import { requireAuth } from "../middleware/auth";
 import { groupFeePlansRouter } from "./groupFeePlans";
 import { groupFeesRouter } from "./groupFees";
@@ -398,7 +400,9 @@ groupsRouter.get("/browse", async (req: Request, res: Response) => {
         viewerIsMember,
         viewerPendingJoinRequestId: pendingJoinByGroup.get(g.id) ?? null,
         canRequestJoin:
-          g.visibility === GroupVisibility.PUBLIC && !viewerIsMember,
+          g.visibility === GroupVisibility.PUBLIC &&
+          !viewerIsMember &&
+          !pendingJoinByGroup.has(g.id),
         members: membersPayload,
         memberCount: isPrivateHidden ? null : raw.length,
       };
@@ -509,6 +513,16 @@ groupsRouter.get("/:groupId/members", async (req: Request, res: Response) => {
 
 const feePlanAssignBodySchema = z.object({
   feePlanId: z.union([z.string().cuid(), z.null()]),
+});
+
+const myAthleteSettingsBodySchema = z.object({
+  nickname: z.string().trim().max(80),
+  dominantFoot: z.nativeEnum(DominantSide).nullable(),
+  dominantHand: z.nativeEnum(DominantSide).nullable(),
+  shirtSize: z.string().trim().max(20),
+  shortsSize: z.string().trim().max(20),
+  shoeSize: z.string().trim().max(20),
+  positionKey: z.string().trim().max(40),
 });
 
 groupsRouter.get("/:groupId/settings", async (req: Request, res: Response) => {
@@ -715,6 +729,134 @@ groupsRouter.patch("/:groupId/settings", async (req: Request, res: Response) => 
     res.json({ group: updated });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Erro ao salvar configurações";
+    res.status(500).json({ error: message });
+  }
+});
+
+groupsRouter.get("/:groupId/my-athlete-settings", async (req: Request, res: Response) => {
+  const groupIdParsed = cuidParam.safeParse(req.params.groupId);
+  if (!groupIdParsed.success) {
+    res.status(400).json({ error: "ID de grupo inválido" });
+    return;
+  }
+  const groupId = groupIdParsed.data;
+  const userId = req.auth!.userId;
+
+  try {
+    const group = await prisma.group.findUnique({
+      where: { id: groupId },
+      select: { id: true, name: true, sport: true },
+    });
+    if (!group) {
+      res.status(404).json({ error: "Grupo não encontrado" });
+      return;
+    }
+
+    const membership = await prisma.groupMember.findUnique({
+      where: { groupId_userId: { groupId, userId } },
+    });
+    if (!membership) {
+      res.status(403).json({ error: "Você não participa deste grupo" });
+      return;
+    }
+
+    res.json({
+      group: {
+        id: group.id,
+        name: group.name,
+        sport: group.sport,
+      },
+      positions: positionsForSport(group.sport),
+      settings: {
+        nickname: membership.nickname ?? null,
+        dominantFoot: membership.dominantFoot ?? null,
+        dominantHand: membership.dominantHand ?? null,
+        shirtSize: membership.shirtSize ?? null,
+        shortsSize: membership.shortsSize ?? null,
+        shoeSize: membership.shoeSize ?? null,
+        positionKey: membership.positionKey ?? null,
+      },
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Erro ao carregar dados";
+    res.status(500).json({ error: message });
+  }
+});
+
+groupsRouter.patch("/:groupId/my-athlete-settings", async (req: Request, res: Response) => {
+  const groupIdParsed = cuidParam.safeParse(req.params.groupId);
+  if (!groupIdParsed.success) {
+    res.status(400).json({ error: "ID de grupo inválido" });
+    return;
+  }
+  const groupId = groupIdParsed.data;
+  const userId = req.auth!.userId;
+
+  const parsed = myAthleteSettingsBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Dados inválidos", details: parsed.error.flatten() });
+    return;
+  }
+
+  try {
+    const group = await prisma.group.findUnique({
+      where: { id: groupId },
+      select: { id: true, sport: true },
+    });
+    if (!group) {
+      res.status(404).json({ error: "Grupo não encontrado" });
+      return;
+    }
+
+    const membership = await prisma.groupMember.findUnique({
+      where: { groupId_userId: { groupId, userId } },
+    });
+    if (!membership) {
+      res.status(403).json({ error: "Você não participa deste grupo" });
+      return;
+    }
+
+    const b = parsed.data;
+    const nickname = b.nickname === "" ? null : b.nickname;
+    const shirtSize = b.shirtSize === "" ? null : b.shirtSize;
+    const shortsSize = b.shortsSize === "" ? null : b.shortsSize;
+    const shoeSize = b.shoeSize === "" ? null : b.shoeSize;
+    const positionKey = b.positionKey === "" ? null : b.positionKey;
+
+    if (!isValidPositionKey(group.sport, positionKey)) {
+      res.status(400).json({
+        error: "Posição inválida para o esporte deste grupo.",
+        code: "INVALID_POSITION_KEY",
+      });
+      return;
+    }
+
+    const updated = await prisma.groupMember.update({
+      where: { id: membership.id },
+      data: {
+        nickname,
+        dominantFoot: b.dominantFoot,
+        dominantHand: b.dominantHand,
+        shirtSize,
+        shortsSize,
+        shoeSize,
+        positionKey,
+      },
+    });
+
+    res.json({
+      settings: {
+        nickname: updated.nickname ?? null,
+        dominantFoot: updated.dominantFoot ?? null,
+        dominantHand: updated.dominantHand ?? null,
+        shirtSize: updated.shirtSize ?? null,
+        shortsSize: updated.shortsSize ?? null,
+        shoeSize: updated.shoeSize ?? null,
+        positionKey: updated.positionKey ?? null,
+      },
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Erro ao salvar dados";
     res.status(500).json({ error: message });
   }
 });
@@ -953,7 +1095,9 @@ groupsRouter.get("/:groupId/public-profile", async (req: Request, res: Response)
       viewerIsMember,
       viewerPendingJoinRequestId: pendingSelf?.id ?? null,
       canRequestJoin:
-        group.visibility === GroupVisibility.PUBLIC && !viewerIsMember,
+        group.visibility === GroupVisibility.PUBLIC &&
+        !viewerIsMember &&
+        !pendingSelf,
       members: enrichedMembers,
       memberCount: isPrivateHidden ? null : allMembers.length,
       ...(showRichPublic && feePlansPayload && richPeriodMonth

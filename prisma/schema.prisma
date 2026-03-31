@@ -47,6 +47,13 @@ enum JoinRequestStatus {
   REJECTED
 }
 
+/** Lado predominante (pé / mão) para uniformes e escalação. */
+enum DominantSide {
+  LEFT
+  RIGHT
+  BOTH
+}
+
 enum AttendanceStatus {
   GOING
   NOT_GOING
@@ -204,6 +211,16 @@ model GroupMember {
   joinedAt  DateTime        @default(now())
   feePlanId String?
   feePlan   GroupFeePlan?   @relation(fields: [feePlanId], references: [id], onDelete: SetNull)
+
+  /** Apelido / nome de guerra neste grupo (uniforme, escalação). */
+  nickname       String?       @db.VarChar(80)
+  dominantFoot   DominantSide?
+  dominantHand   DominantSide?
+  shirtSize      String?       @db.VarChar(20)
+  shortsSize     String?       @db.VarChar(20)
+  shoeSize       String?       @db.VarChar(20)
+  /** Valor de `SPORT_POSITIONS[sport]` (ex.: GOALKEEPER). */
+  positionKey    String?       @db.VarChar(40)
 
   @@unique([groupId, userId])
   @@map("group_members")

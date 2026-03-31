@@ -13,6 +13,7 @@ import {
   isPastRsvpDeadline,
   eventSettingsDeadlineAt,
 } from "../lib/eventRsvp";
+import { positionLabelForSport } from "../lib/sportPositions";
 import { RESULT_AND_SCOUT_UNLOCK_MS, resultAndScoutUnlocked } from "../lib/gameUnlock";
 import { canAssignGameTeams, canManageGroupGames } from "../lib/groupPermissions";
 import { prisma } from "../lib/prisma";
@@ -55,6 +56,16 @@ const patchGameSchema = z.discriminatedUnion("mode", [
   }),
   z.object({
     mode: z.literal("clear"),
+  }),
+  z.object({
+    mode: z.literal("details"),
+    kind: z.nativeEnum(GameKind),
+    title: z.string().trim().max(120),
+    location: z.union([z.string().trim().max(200), z.literal("")]),
+    startsAt: z
+      .string()
+      .min(1, "Data/hora obrigatória")
+      .refine((s) => !Number.isNaN(new Date(s).getTime()), "Data/hora inválida (ISO 8601)"),
   }),
 ]);
 
@@ -429,6 +440,8 @@ groupGamesRouter.get("/:gameId", async (req: Request, res: Response) => {
           fullName: m.user.fullName,
           phone: m.user.phone,
           role: m.role,
+          positionKey: m.positionKey ?? null,
+          positionLabel: positionLabelForSport(groupSport, m.positionKey),
           attendance: a
             ? {
                 status: a.status,
@@ -737,15 +750,72 @@ groupGamesRouter.patch("/:gameId", async (req: Request, res: Response) => {
   }
 
   const member = await requireGroupMember(groupId, userId);
-  if (!member || !canManageGroupGames(member.role)) {
-    res.status(403).json({
-      error: "Apenas presidente, vice, tesoureiro ou moderador podem registrar resultado.",
-      code: "GAME_OUTCOME_FORBIDDEN",
-    });
+  if (!member) {
+    res.status(403).json({ error: "Você não participa deste grupo" });
     return;
   }
 
   try {
+    if (parsed.data.mode === "details") {
+      const gameRow = await prisma.groupGame.findFirst({
+        where: { id: gameId, groupId },
+        select: { id: true, createdByUserId: true },
+      });
+      if (!gameRow) {
+        res.status(404).json({ error: "Jogo não encontrado" });
+        return;
+      }
+      const isCreator = gameRow.createdByUserId === userId;
+      if (!canManageGroupGames(member.role) && !isCreator) {
+        res.status(403).json({
+          error:
+            "Apenas quem criou o evento ou a diretoria (presidente, vice, tesoureiro ou moderador) pode alterar estes dados.",
+          code: "GAME_DETAILS_FORBIDDEN",
+        });
+        return;
+      }
+      const d = parsed.data;
+      const startsAt = new Date(d.startsAt);
+      const title = d.title.trim() || "Jogo";
+      const location = d.location === "" ? null : d.location.trim();
+
+      const updatedGame = await prisma.groupGame.update({
+        where: { id: gameId },
+        data: {
+          kind: d.kind,
+          title,
+          location,
+          startsAt,
+        },
+        select: {
+          id: true,
+          kind: true,
+          title: true,
+          location: true,
+          startsAt: true,
+        },
+      });
+
+      res.json({
+        game: {
+          id: updatedGame.id,
+          kind: updatedGame.kind,
+          title: updatedGame.title,
+          location: updatedGame.location,
+          startsAt: updatedGame.startsAt.toISOString(),
+        },
+      });
+      return;
+    }
+
+    if (!canManageGroupGames(member.role)) {
+      res.status(403).json({
+        error: "Apenas presidente, vice, tesoureiro ou moderador podem registrar resultado.",
+        code: "GAME_OUTCOME_FORBIDDEN",
+      });
+      return;
+    }
+
     const game = await prisma.groupGame.findFirst({
       where: { id: gameId, groupId },
       select: { id: true, startsAt: true },
